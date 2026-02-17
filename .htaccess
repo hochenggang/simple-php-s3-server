@@ -5,55 +5,14 @@
     RewriteRule .* - [e=HTTP_AUTHORIZATION:%1]
 
     RewriteRule ^.multipart/ - [F,L]
-    RewriteRule ^data/.multipart/ - [F,L]
-
-    RewriteRule ^.metadata/ - [F,L]
-    RewriteRule ^data/.metadata/ - [F,L]
-
     RewriteRule ^\.env - [F,L]
     RewriteRule ^\.env\.example - [F,L]
-    RewriteRule ^init-meta-cache\.php - [F,L]
-    RewriteRule ^autoload\.php - [F,L]
-    RewriteRule ^design\.md - [F,L]
-
-    RewriteRule ^\.git/ - [F,L]
-    RewriteRule ^\.svn/ - [F,L]
-    RewriteRule ^\.hg/ - [F,L]
-
-    RewriteRule ^\.idea/ - [F,L]
-    RewriteRule ^\.vscode/ - [F,L]
-
     RewriteCond %{REQUEST_FILENAME} !-f
     RewriteCond %{REQUEST_FILENAME} !-d
 
     RewriteRule ^(.*)$ index.php [L,QSA]
 </IfModule>
 
-<IfModule mod_headers.c>
-    RequestHeader unset Accept-Encoding
-    Header unset Transfer-Encoding
-    Header always unset Transfer-Encoding
-    
-    <FilesMatch "^\.(env|md|gitignore|htaccess)$">
-        Header set Cache-Control "no-store, no-cache, must-revalidate"
-    </FilesMatch>
+<IfModule mod_proxy_fcgi.c>
+    SetEnv ap_trust_cgilike_cl 1
 </IfModule>
-
-<IfModule mod_php.c>
-    php_value output_buffering 0
-</IfModule>
-
-<IfModule mod_php7.c>
-    php_value output_buffering 0
-</IfModule>
-
-<IfModule mod_php8.c>
-    php_value output_buffering 0
-</IfModule>
-
-Options -Indexes
-
-<FilesMatch "^\.">
-    Order allow,deny
-    Deny from all
-</FilesMatch>

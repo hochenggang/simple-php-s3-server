@@ -22,6 +22,12 @@ class Authenticator
     {
         $authHeader = $this->request->getHeader('Authorization');
 
+        // Check for presigned URL request (X-Amz-Credential in query string)
+        if ($this->isPresignedUrlRequest()) {
+            $this->authenticatePresignedUrl();
+            return;
+        }
+
         if (empty($authHeader)) {
             throw S3Exception::accessDenied();
         }
@@ -35,6 +41,12 @@ class Authenticator
         } else {
             throw S3Exception::accessDenied();
         }
+    }
+
+    private function isPresignedUrlRequest(): bool
+    {
+        return $this->request->hasQueryParam('X-Amz-Credential') ||
+               $this->request->hasQueryParam('x-amz-credential');
     }
 
     private function authenticateAwsSignatureV4(string $authHeader): void
@@ -258,6 +270,213 @@ class Authenticator
         $kSigning = hash_hmac('sha256', 'aws4_request', $kService, true);
 
         return hash_hmac('sha256', $stringToSign, $kSigning);
+    }
+
+    private function calculateSignatureV4WithDate(string $stringToSign, string $secretKey, string $date, string $region, string $service): string
+    {
+        $kDate = hash_hmac('sha256', $date, 'AWS4' . $secretKey, true);
+        $kRegion = hash_hmac('sha256', $region, $kDate, true);
+        $kService = hash_hmac('sha256', $service, $kRegion, true);
+        $kSigning = hash_hmac('sha256', 'aws4_request', $kService, true);
+
+        return hash_hmac('sha256', $stringToSign, $kSigning);
+    }
+
+    private function authenticatePresignedUrl(): void
+    {
+        $presignedData = $this->parsePresignedUrlParams();
+
+        // Check if signature has expired
+        $this->checkPresignedUrlExpiry($presignedData);
+
+        $accessKeyId = $presignedData['Credential']['AccessKeyId'];
+        $secretKey = Config::getSecretKey($accessKeyId);
+        if ($secretKey === null) {
+            throw S3Exception::invalidAccessKeyId();
+        }
+
+        if ($this->debug) {
+            Logger::debug("Presigned URL Auth: AccessKeyId={$accessKeyId}");
+        }
+
+        // Build string to sign for presigned URL
+        $stringToSign = $this->buildPresignedUrlStringToSign($presignedData);
+        $signature = $this->calculatePresignedUrlSignature($stringToSign, $secretKey, $presignedData);
+
+        if (!hash_equals($signature, $presignedData['Signature'])) {
+            if ($this->debug) {
+                Logger::debug("Presigned URL Signature mismatch: expected={$signature}, got={$presignedData['Signature']}");
+                Logger::debug("StringToSign:\n" . $stringToSign);
+            }
+            throw S3Exception::signatureDoesNotMatch();
+        }
+    }
+
+    private function parsePresignedUrlParams(): array
+    {
+        // Get parameters from query string (case-insensitive)
+        $credential = $this->request->getQueryParam('X-Amz-Credential') ??
+                      $this->request->getQueryParam('x-amz-credential');
+        $algorithm = $this->request->getQueryParam('X-Amz-Algorithm') ??
+                     $this->request->getQueryParam('x-amz-algorithm');
+        $date = $this->request->getQueryParam('X-Amz-Date') ??
+                $this->request->getQueryParam('x-amz-date');
+        $expires = $this->request->getQueryParam('X-Amz-Expires') ??
+                   $this->request->getQueryParam('x-amz-expires');
+        $signedHeaders = $this->request->getQueryParam('X-Amz-SignedHeaders') ??
+                         $this->request->getQueryParam('x-amz-signedheaders');
+        $signature = $this->request->getQueryParam('X-Amz-Signature') ??
+                     $this->request->getQueryParam('x-amz-signature');
+
+        if (empty($credential) || empty($algorithm) || empty($date) ||
+            empty($signedHeaders) || empty($signature)) {
+            throw S3Exception::accessDenied();
+        }
+
+        // Parse credential: AccessKeyId/Date/Region/Service/aws4_request
+        $credentialParts = explode('/', $credential);
+        if (count($credentialParts) < 5) {
+            throw S3Exception::invalidAccessKeyId();
+        }
+
+        return [
+            'Algorithm' => $algorithm,
+            'Credential' => [
+                'AccessKeyId' => $credentialParts[0],
+                'Date' => $credentialParts[1],
+                'Region' => $credentialParts[2],
+                'Service' => $credentialParts[3],
+                'RequestType' => $credentialParts[4],
+            ],
+            'AmzDate' => $date,
+            'Expires' => $expires ? (int)$expires : null,
+            'SignedHeaders' => $signedHeaders,
+            'Signature' => $signature,
+        ];
+    }
+
+    private function checkPresignedUrlExpiry(array $presignedData): void
+    {
+        $expires = $presignedData['Expires'];
+        if ($expires === null) {
+            return; // No expiry specified
+        }
+
+        $amzDate = $presignedData['AmzDate'];
+        $requestTime = \DateTime::createFromFormat('Ymd\THis\Z', $amzDate, new \DateTimeZone('UTC'));
+
+        if ($requestTime === false) {
+            throw S3Exception::invalidRequest('Invalid X-Amz-Date format');
+        }
+
+        $expiryTime = clone $requestTime;
+        $expiryTime->modify("+{$expires} seconds");
+
+        $now = new \DateTime('now', new \DateTimeZone('UTC'));
+
+        if ($now > $expiryTime) {
+            throw S3Exception::expiredToken('Request has expired.');
+        }
+    }
+
+    private function buildPresignedUrlStringToSign(array $presignedData): string
+    {
+        $method = $this->request->getMethod();
+        $uri = $this->request->getUri();
+        $queryString = $this->request->getQueryString();
+        $headers = $this->request->getHeaders();
+
+        $canonicalUri = $this->encodeUri($uri);
+
+        // Build canonical query string for presigned URL (excluding X-Amz-Signature)
+        $canonicalQueryString = $this->buildPresignedCanonicalQueryString($queryString);
+
+        // Build canonical headers
+        $canonicalHeaders = $this->buildCanonicalHeaders($headers, $presignedData['SignedHeaders']);
+        $signedHeaders = strtolower($presignedData['SignedHeaders']);
+
+        // For presigned URLs, use 'UNSIGNED-PAYLOAD' as the payload hash
+        $hashedPayload = 'UNSIGNED-PAYLOAD';
+
+        $canonicalRequest = implode("\n", [
+            $method,
+            $canonicalUri,
+            $canonicalQueryString,
+            $canonicalHeaders,
+            '',
+            $signedHeaders,
+            $hashedPayload,
+        ]);
+
+        $amzDate = $presignedData['AmzDate'];
+        $date = $presignedData['Credential']['Date'];
+        $region = $presignedData['Credential']['Region'];
+        $service = $presignedData['Credential']['Service'];
+        $scope = "{$date}/{$region}/{$service}/aws4_request";
+
+        $stringToSign = implode("\n", [
+            'AWS4-HMAC-SHA256',
+            $amzDate,
+            $scope,
+            hash('sha256', $canonicalRequest),
+        ]);
+
+        if ($this->debug) {
+            Logger::debug("Presigned URL CanonicalRequest:\n" . $canonicalRequest);
+            Logger::debug("Presigned URL StringToSign:\n" . $stringToSign);
+        }
+
+        return $stringToSign;
+    }
+
+    private function buildPresignedCanonicalQueryString(string $queryString): string
+    {
+        if (empty($queryString)) {
+            return '';
+        }
+
+        $params = [];
+        $pairs = explode('&', $queryString);
+
+        foreach ($pairs as $pair) {
+            if (strpos($pair, '=') !== false) {
+                list($key, $value) = explode('=', $pair, 2);
+                $decodedKey = rawurldecode($key);
+
+                // Exclude X-Amz-Signature from canonical query string
+                if (strcasecmp($decodedKey, 'X-Amz-Signature') === 0) {
+                    continue;
+                }
+
+                $params[$decodedKey] = rawurldecode($value);
+            } else {
+                $decodedKey = rawurldecode($pair);
+                if (strcasecmp($decodedKey, 'X-Amz-Signature') === 0) {
+                    continue;
+                }
+                $params[$decodedKey] = '';
+            }
+        }
+
+        // Sort parameters by key
+        ksort($params, SORT_STRING);
+
+        // Build normalized query string
+        $normalized = [];
+        foreach ($params as $key => $value) {
+            $normalized[] = rawurlencode($key) . '=' . rawurlencode($value);
+        }
+
+        return implode('&', $normalized);
+    }
+
+    private function calculatePresignedUrlSignature(string $stringToSign, string $secretKey, array $presignedData): string
+    {
+        $date = $presignedData['Credential']['Date'];
+        $region = $presignedData['Credential']['Region'];
+        $service = $presignedData['Credential']['Service'];
+
+        return $this->calculateSignatureV4WithDate($stringToSign, $secretKey, $date, $region, $service);
     }
 
     private function authenticateAwsSignatureV2(string $authHeader): void

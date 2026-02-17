@@ -2,6 +2,8 @@
 
 namespace S3Gateway\Http;
 
+use S3Gateway\Logger;
+
 class Response
 {
     private int $statusCode = 200;
@@ -42,9 +44,13 @@ class Response
         $this->statusCode = $statusCode;
         http_response_code($this->statusCode);
 
+        Logger::debug("[sendEmpty] Sending headers for status {$statusCode}:");
+        // Send headers, ensuring Content-Length is preserved
         foreach ($this->headers as $name => $value) {
-            header("{$name}: {$value}");
+            Logger::debug("[sendEmpty]   {$name}: {$value}");
+            header("{$name}: {$value}", true);
         }
+        Logger::debug("[sendEmpty] Headers sent");
     }
 
     public function sendFile(string $filePath, array $options = []): void

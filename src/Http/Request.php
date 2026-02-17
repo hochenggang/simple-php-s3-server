@@ -2,6 +2,8 @@
 
 namespace S3Gateway\Http;
 
+use S3Gateway\Logger;
+
 class Request
 {
     private string $method;
@@ -60,16 +62,36 @@ class Request
 
     private function readBody(): string
     {
+        $contentLength = $_SERVER['CONTENT_LENGTH'] ?? 'not set';
+        $transferEncoding = $_SERVER['HTTP_TRANSFER_ENCODING'] ?? 'not set';
+        Logger::debug("[readBody] Content-Length: {$contentLength}, Transfer-Encoding: {$transferEncoding}");
+
         $body = file_get_contents('php://input');
-        
+        $rawLength = strlen($body);
+        Logger::debug("[readBody] Raw body length from php://input: {$rawLength}");
+
         if ($body === false || $body === '') {
+            Logger::debug("[readBody] Body is empty, returning empty string");
             return '';
         }
 
+        // Log first 200 bytes in hex for debugging chunked encoding
+        $hexPreview = bin2hex(substr($body, 0, 200));
+        Logger::debug("[readBody] Body hex preview (first 200 bytes): {$hexPreview}");
+
+        // Check if body starts with hex number (chunked encoding marker)
+        $isChunkedPattern = preg_match('/^[0-9a-fA-F]+\r\n/', $body) === 1;
+        Logger::debug("[readBody] Is chunked pattern: " . ($isChunkedPattern ? 'yes' : 'no'));
+
         if ($this->isChunked($body)) {
-            $body = $this->decodeChunked($body);
+            Logger::debug("[readBody] Detected chunked encoding, decoding...");
+            $decodedBody = $this->decodeChunked($body);
+            $decodedLength = strlen($decodedBody);
+            Logger::debug("[readBody] Decoded body length: {$decodedLength}");
+            return $decodedBody;
         }
-        
+
+        Logger::debug("[readBody] Returning raw body, length: {$rawLength}");
         return $body;
     }
 

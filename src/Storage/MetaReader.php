@@ -14,14 +14,18 @@ class MetaReader
     public function getObjectMeta(string $bucket, string $key): ?array
     {
         $filePath = $this->pathResolver->objectPath($bucket, $key);
+        \S3Gateway\Logger::debug("[getObjectMeta] bucket={$bucket}, key={$key}, path={$filePath}");
 
         if (!file_exists($filePath)) {
+            \S3Gateway\Logger::debug("[getObjectMeta] File not found: {$filePath}");
             return null;
         }
 
         clearstatcache(true, $filePath);
 
         $size = filesize($filePath);
+        \S3Gateway\Logger::debug("[getObjectMeta] filesize result: " . ($size === false ? 'false' : $size));
+
         if ($size === false) {
             return null;
         }
@@ -33,6 +37,8 @@ class MetaReader
 
         $mime = $this->detectMimeType($filePath);
         $etag = $this->calculateEtag($key, $size);
+
+        \S3Gateway\Logger::debug("[getObjectMeta] Returning: size={$size}, mtime={$mtime}, etag={$etag}");
 
         return [
             'size' => $size,

@@ -322,27 +322,41 @@ class FileStorage
     public function savePart(string $bucket, string $uploadId, int $partNumber, string $content): bool
     {
         $uploadDir = $this->pathResolver->multipartPath($bucket, $uploadId);
+        $contentLength = strlen($content);
+        \S3Gateway\Logger::debug("[savePart] bucket={$bucket}, uploadId={$uploadId}, partNumber={$partNumber}, contentLength={$contentLength}");
 
         if (!$this->pathResolver->ensureDir($uploadDir)) {
+            \S3Gateway\Logger::debug("[savePart] Error: Failed to ensure upload dir: {$uploadDir}");
             return false;
         }
 
         $partPath = $this->pathResolver->partPath($bucket, $uploadId, $partNumber);
+        \S3Gateway\Logger::debug("[savePart] Saving to: {$partPath}");
+
         $result = @file_put_contents($partPath, $content);
-        return $result !== false;
+        $saved = $result !== false;
+
+        if ($saved) {
+            $savedSize = filesize($partPath);
+            \S3Gateway\Logger::debug("[savePart] Success: saved {$savedSize} bytes to {$partPath}");
+        } else {
+            \S3Gateway\Logger::debug("[savePart] Error: file_put_contents failed for {$partPath}");
+        }
+
+        return $saved;
     }
 
-    public function completeMultipartUpload(string $bucket, string $key, string $uploadId, array $parts): bool
+    public function completeMultipartUpload(string $bucket, string $key, string $uploadId, array $parts): ?array
     {
         $uploadDir = $this->pathResolver->multipartPath($bucket, $uploadId);
         $filePath = $this->pathResolver->objectPath($bucket, $key);
 
         if (!file_exists($uploadDir)) {
-            return false;
+            return null;
         }
 
         if (!$this->pathResolver->ensureParentDir($filePath)) {
-            return false;
+            return null;
         }
 
         if (file_exists($filePath)) {
@@ -351,7 +365,7 @@ class FileStorage
 
         $fp = @fopen($filePath, 'wb');
         if (!$fp) {
-            return false;
+            return null;
         }
 
         $totalBytesWritten = 0;
@@ -364,7 +378,7 @@ class FileStorage
                 if (!file_exists($partPath)) {
                     fclose($fp);
                     @unlink($filePath);
-                    return false;
+                    return null;
                 }
 
                 clearstatcache(true, $partPath);
@@ -374,7 +388,7 @@ class FileStorage
                 if (!$partFp) {
                     fclose($fp);
                     @unlink($filePath);
-                    return false;
+                    return null;
                 }
 
                 while (!feof($partFp)) {
@@ -395,19 +409,24 @@ class FileStorage
 
             if ($finalSize !== $totalBytesWritten) {
                 @unlink($filePath);
-                return false;
+                return null;
             }
 
             $this->safeDeleteDirectory($uploadDir);
 
-            \S3Gateway\Logger::info("Multipart upload completed: bucket={$bucket}, key={$key}, uploadId={$uploadId}, size={$finalSize}");
+            $etag = $this->metaReader->calculateEtag($key, $finalSize);
 
-            return true;
+            \S3Gateway\Logger::info("Multipart upload completed: bucket={$bucket}, key={$key}, uploadId={$uploadId}, size={$finalSize}, etag={$etag}");
+
+            return [
+                'size' => $finalSize,
+                'etag' => $etag,
+            ];
         } catch (\Exception $e) {
             fclose($fp);
             @unlink($filePath);
             error_log('FileStorage::completeMultipartUpload error: ' . $e->getMessage());
-            return false;
+            return null;
         }
     }
 

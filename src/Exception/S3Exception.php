@@ -108,4 +108,9 @@ class S3Exception extends \Exception
     {
         return new self('InvalidRange', 'The requested range cannot be satisfied.', 416, $resource);
     }
+
+    public static function expiredToken(string $message = 'The provided token has expired.'): self
+    {
+        return new self('ExpiredToken', $message, 400);
+    }
 }

@@ -40,7 +40,7 @@ s3 = boto3.client(
     aws_access_key_id='your-access-key1',
     aws_secret_access_key='your-secret-key',
     region_name='us-east-1',  # Can be any value
-    verify=False
+    verify=True
 )
 
 # Upload file

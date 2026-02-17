@@ -6,6 +6,7 @@ use S3Gateway\Exception\S3Exception;
 use S3Gateway\Http\Request;
 use S3Gateway\Http\Response;
 use S3Gateway\Storage\FileStorage;
+use S3Gateway\Logger;
 
 class MultipartController
 {
@@ -54,33 +55,51 @@ class MultipartController
         $uploadId = $request->getQueryParam('uploadId');
         $partNumber = (int)$request->getQueryParam('partNumber');
 
+        Logger::debug("[uploadPart] Start: bucket={$bucket}, key={$key}, uploadId={$uploadId}, partNumber={$partNumber}");
+
         if (empty($bucket) || empty($key)) {
+            Logger::debug("[uploadPart] Error: Bucket and key required");
             throw S3Exception::invalidRequest('Bucket and key required');
         }
 
         if (empty($uploadId)) {
+            Logger::debug("[uploadPart] Error: uploadId required");
             throw S3Exception::invalidRequest('uploadId required');
         }
 
         if ($partNumber <= 0) {
+            Logger::debug("[uploadPart] Error: Invalid partNumber");
             throw S3Exception::invalidRequest('Invalid partNumber');
         }
 
         $uploadDir = $this->storage->getPathResolver()->multipartPath($bucket, $uploadId);
+        Logger::debug("[uploadPart] Upload dir: {$uploadDir}, exists=" . (file_exists($uploadDir) ? 'yes' : 'no'));
+
         if (!file_exists($uploadDir)) {
+            Logger::debug("[uploadPart] Error: Upload dir not found");
             throw S3Exception::noSuchUpload("/{$bucket}/{$key}");
         }
 
         $body = $request->getBody();
+        $bodyLength = strlen($body);
+        Logger::debug("[uploadPart] Body length: {$bodyLength}");
+
+        if ($bodyLength === 0) {
+            Logger::debug("[uploadPart] Warning: Body is empty!");
+        }
 
         if (!$this->storage->savePart($bucket, $uploadId, $partNumber, $body)) {
+            Logger::debug("[uploadPart] Error: Failed to write part file");
             throw S3Exception::internalError('Failed to write part file', "/{$bucket}/{$key}");
         }
 
         $partMeta = $this->storage->getMetaReader()->getPartMeta($bucket, $uploadId, $partNumber);
         if ($partMeta === null) {
+            Logger::debug("[uploadPart] Error: Failed to read part metadata");
             throw S3Exception::internalError('Failed to read part metadata', "/{$bucket}/{$key}");
         }
+
+        Logger::debug("[uploadPart] Success: partNumber={$partNumber}, etag={$partMeta['etag']}, size={$partMeta['size']}");
 
         $response
             ->setHeader('ETag', '"' . $partMeta['etag'] . '"')
@@ -159,12 +178,13 @@ class MultipartController
             }
         }
 
-        if (!$this->storage->completeMultipartUpload($bucket, $key, $uploadId, $parts)) {
+        $result = $this->storage->completeMultipartUpload($bucket, $key, $uploadId, $parts);
+        if ($result === null) {
             throw S3Exception::internalError('Failed to complete multipart upload', "/{$bucket}/{$key}");
         }
 
         $location = "http://{$_SERVER['HTTP_HOST']}/{$bucket}/{$key}";
-        $xml = XmlResponse::completeMultipartUpload($bucket, $key, $location);
+        $xml = XmlResponse::completeMultipartUpload($bucket, $key, $location, $result['etag'], $result['size']);
 
         $response
             ->setHeader('Content-Type', 'application/xml')

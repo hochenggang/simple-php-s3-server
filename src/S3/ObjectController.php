@@ -6,6 +6,7 @@ use S3Gateway\Exception\S3Exception;
 use S3Gateway\Http\Request;
 use S3Gateway\Http\Response;
 use S3Gateway\Storage\FileStorage;
+use S3Gateway\Logger;
 
 class ObjectController
 {
@@ -194,6 +195,8 @@ class ObjectController
         $bucket = $request->getBucket();
         $key = $request->getKey();
 
+        Logger::debug("[headObject] bucket={$bucket}, key={$key}");
+
         if (empty($bucket) || empty($key)) {
             throw S3Exception::invalidRequest('Bucket and key required');
         }
@@ -201,8 +204,11 @@ class ObjectController
         $meta = $this->storage->getObjectMeta($bucket, $key);
 
         if ($meta === null) {
+            Logger::debug("[headObject] Object not found: /{$bucket}/{$key}");
             throw S3Exception::noSuchKey("/{$bucket}/{$key}");
         }
+
+        Logger::debug("[headObject] Returning headers: Content-Length={$meta['size']}, ETag={$meta['etag']}");
 
         $response
             ->setHeader('Content-Length', (string)$meta['size'])

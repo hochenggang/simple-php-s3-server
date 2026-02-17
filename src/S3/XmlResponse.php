@@ -165,12 +165,16 @@ XML;
 XML;
     }
 
-    public static function completeMultipartUpload(string $bucket, string $key, string $location): string
+    public static function completeMultipartUpload(string $bucket, string $key, string $location, string $etag, int $size): string
     {
         $xmlNs = self::$xmlNs;
         $bucket = self::escape($bucket);
         $key = self::escape($key);
         $location = self::escape($location);
+        $etag = self::escape($etag);
+        if (strpos($etag, '"') !== 0) {
+            $etag = '"' . $etag . '"';
+        }
 
         return <<<XML
 <?xml version="1.0" encoding="UTF-8"?>
@@ -178,6 +182,8 @@ XML;
     <Location>{$location}</Location>
     <Bucket>{$bucket}</Bucket>
     <Key>{$key}</Key>
+    <ETag>{$etag}</ETag>
+    <Size>{$size}</Size>
 </CompleteMultipartUploadResult>
 XML;
     }
