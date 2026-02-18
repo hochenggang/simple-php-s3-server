@@ -2,6 +2,7 @@
 
 namespace S3Gateway\Http;
 
+use S3Gateway\Config;
 use S3Gateway\Logger;
 
 class Response
@@ -30,6 +31,9 @@ class Response
 
     public function send(): void
     {
+        // 调试模式：记录响应信息
+        $this->logResponse();
+
         http_response_code($this->statusCode);
 
         foreach ($this->headers as $name => $value) {
@@ -37,6 +41,55 @@ class Response
         }
 
         echo $this->body;
+    }
+
+    /**
+     * 记录响应信息，用于调试
+     */
+    private function logResponse(): void
+    {
+        if (!Config::appDebug()) {
+            return;
+        }
+
+        Logger::debug("[Response] ========== Response Start ==========");
+        Logger::debug("[Response] Status Code: {$this->statusCode}");
+
+        // 记录所有响应头部
+        Logger::debug("[Response] --- Response Headers ---");
+        if (empty($this->headers)) {
+            Logger::debug("[Response]   (No custom headers set)");
+        } else {
+            foreach ($this->headers as $name => $value) {
+                Logger::debug("[Response]   {$name}: {$value}");
+            }
+        }
+
+        // 记录响应体信息
+        $bodyLength = strlen($this->body);
+        Logger::debug("[Response] --- Response Body ---");
+        Logger::debug("[Response]   Body Length: {$bodyLength} bytes");
+
+        // 如果响应体较小（小于 1000 字节），记录完整内容
+        if ($bodyLength > 0 && $bodyLength < 1000) {
+            // 截断并清理内容以便日志记录
+            $preview = substr($this->body, 0, 500);
+            $preview = str_replace(["\r", "\n"], ['\r', '\n'], $preview);
+            Logger::debug("[Response]   Body Preview: {$preview}");
+        } elseif ($bodyLength >= 1000) {
+            $preview = substr($this->body, 0, 200);
+            $preview = str_replace(["\r", "\n"], ['\r', '\n'], $preview);
+            Logger::debug("[Response]   Body Preview (first 200 chars): {$preview}...");
+        } else {
+            Logger::debug("[Response]   Body: (empty)");
+        }
+
+        // 记录 Content-Type（如果已设置）
+        if (isset($this->headers['Content-Type'])) {
+            Logger::debug("[Response]   Content-Type: {$this->headers['Content-Type']}");
+        }
+
+        Logger::debug("[Response] ========== Response End ==========");
     }
 
     public function sendEmpty(int $statusCode = 204): void
