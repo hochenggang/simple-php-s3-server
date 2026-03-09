@@ -38,8 +38,9 @@ class Authenticator
 
     /**
      * 执行认证
+     * @return string 返回 accessKeyId
      */
-    public function authenticate(): void
+    public function authenticate(): string
     {
         $authHeader = $this->request->getHeader('Authorization');
         
@@ -49,12 +50,12 @@ class Authenticator
         $this->logDebug("Query String: " . $this->request->getQueryString());
         $this->logDebug("Authorization Header: " . ($authHeader ?? 'null'));
 
-        // 检查是否为预签名 URL 请求
         if ($this->isPresignedUrlRequest()) {
             $this->logDebug("Detected presigned URL request");
-            $this->authenticatePresignedUrl();
+            $accessKeyId = $this->authenticatePresignedUrl();
+            $this->checkBucketPermission($accessKeyId);
             $this->logDebug("=== Authentication Success (Presigned URL) ===");
-            return;
+            return $accessKeyId;
         }
 
         if (empty($authHeader)) {
@@ -62,22 +63,59 @@ class Authenticator
             throw S3Exception::accessDenied();
         }
 
-        // 根据认证类型分发
+        $accessKeyId = null;
         if (strpos($authHeader, 'AWS4-HMAC-SHA256') === 0) {
             $this->logDebug("Detected AWS4-HMAC-SHA256 signature");
-            $this->authenticateAwsSignatureV4($authHeader);
+            $accessKeyId = $this->authenticateAwsSignatureV4($authHeader);
         } elseif (strpos($authHeader, 'AWS ') === 0) {
             $this->logDebug("Detected AWS Signature V2");
-            $this->authenticateAwsSignatureV2($authHeader);
+            $accessKeyId = $this->authenticateAwsSignatureV2($authHeader);
         } elseif (strpos($authHeader, 'Bearer ') === 0) {
             $this->logDebug("Detected Bearer token");
             $this->authenticateBearerToken($authHeader);
+            $this->logDebug("=== Authentication Success (Bearer Token) ===");
+            return '';
         } else {
             $this->logDebug("Unknown authorization type: " . substr($authHeader, 0, 50));
             throw S3Exception::accessDenied();
         }
         
+        $this->checkBucketPermission($accessKeyId);
+        
         $this->logDebug("=== Authentication Success ===");
+        return $accessKeyId;
+    }
+
+    /**
+     * 检查桶权限
+     */
+    private function checkBucketPermission(string $accessKeyId): void
+    {
+        $bucketName = $this->extractBucketName();
+        if ($bucketName) {
+            $this->logDebug("Checking bucket permission for: {$bucketName}");
+            if (!Config::isBucketAllowed($accessKeyId, $bucketName)) {
+                $this->logDebug("Access denied for bucket: {$bucketName}");
+                throw S3Exception::accessDenied("Access denied for bucket: {$bucketName}");
+            }
+            $this->logDebug("Bucket permission granted: {$bucketName}");
+        }
+    }
+
+    /**
+     * 从请求 URI 中提取桶名
+     */
+    private function extractBucketName(): ?string
+    {
+        $uri = $this->request->getUri();
+        $parts = explode('/', ltrim($uri, '/'));
+        
+        // 对于 S3 风格的 URI，第一个部分是桶名
+        if (count($parts) > 0 && !empty($parts[0])) {
+            return $parts[0];
+        }
+        
+        return null;
     }
 
     /**
@@ -92,7 +130,7 @@ class Authenticator
     /**
      * AWS Signature Version 4 认证
      */
-    private function authenticateAwsSignatureV4(string $authHeader): void
+    private function authenticateAwsSignatureV4(string $authHeader): string
     {
         try {
             // 解析 Authorization header
@@ -132,6 +170,7 @@ class Authenticator
             }
 
             $this->logDebug("Signature verified successfully");
+            return $accessKeyId;
 
         } catch (S3Exception $e) {
             throw $e;
@@ -471,18 +510,18 @@ class Authenticator
     /**
      * 预签名 URL 认证
      */
-    private function authenticatePresignedUrl(): void
+    private function authenticatePresignedUrl(): string
     {
         try {
             $presignedData = $this->parsePresignedUrlParams();
             
-            $this->logDebug("Presigned URL Auth: AccessKeyId={$presignedData['Credential']['AccessKeyId']}");
+            $accessKeyId = $presignedData['Credential']['AccessKeyId'];
+            $this->logDebug("Presigned URL Auth: AccessKeyId={$accessKeyId}");
             $this->logDebug("Expires: " . ($presignedData['Expires'] ?? 'not set'));
 
             // 检查签名是否过期
             $this->checkPresignedUrlExpiry($presignedData);
 
-            $accessKeyId = $presignedData['Credential']['AccessKeyId'];
             $secretKey = Config::getSecretKey($accessKeyId);
             if ($secretKey === null) {
                 $this->logDebug("Secret key not found for presigned URL: {$accessKeyId}");
@@ -505,6 +544,7 @@ class Authenticator
             }
 
             $this->logDebug("Presigned URL signature verified successfully");
+            return $accessKeyId;
 
         } catch (S3Exception $e) {
             throw $e;
@@ -696,7 +736,7 @@ class Authenticator
     /**
      * AWS Signature Version 2 认证（遗留支持）
      */
-    private function authenticateAwsSignatureV2(string $authHeader): void
+    private function authenticateAwsSignatureV2(string $authHeader): string
     {
         $pattern = '/AWS\s+([^:]+):(.+)/';
         if (!preg_match($pattern, $authHeader, $matches)) {
@@ -720,6 +760,8 @@ class Authenticator
         if (!hash_equals($expectedSignature, $signature)) {
             throw S3Exception::signatureDoesNotMatch();
         }
+
+        return $accessKeyId;
     }
 
     /**
@@ -738,12 +780,12 @@ class Authenticator
     /**
      * 检查请求大小
      */
-    public function checkRequestSize(): void
+    public function checkRequestSize(string $accessKeyId): void
     {
         $contentLength = $this->request->getHeader('Content-Length');
-        $maxSize = Config::maxUploadSize();
+        $maxSize = Config::getFileMaxSize($accessKeyId);
 
-        if ($contentLength !== null && (int)$contentLength > $maxSize) {
+        if ($maxSize > 0 && $contentLength !== null && (int)$contentLength > $maxSize) {
             throw S3Exception::entityTooLarge((int)$contentLength, $maxSize);
         }
     }

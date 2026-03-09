@@ -41,8 +41,8 @@ class Router
                 return;
             }
 
-            $this->authenticator->authenticate();
-            $this->authenticator->checkRequestSize();
+            $accessKeyId = $this->authenticator->authenticate();
+            $this->authenticator->checkRequestSize($accessKeyId);
 
             $this->dispatch();
 

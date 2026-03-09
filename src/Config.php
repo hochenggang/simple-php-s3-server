@@ -5,6 +5,7 @@ namespace S3Gateway;
 class Config
 {
     private static ?array $env = null;
+    private static ?array $accessKeys = null;
 
     private static function load(): void
     {
@@ -14,23 +15,65 @@ class Config
 
         self::$env = [];
 
-        $envFile = dirname(__DIR__) . '/.env';
-        if (file_exists($envFile)) {
-            $lines = file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-            if ($lines !== false) {
-                foreach ($lines as $line) {
-                    $line = trim($line);
-                    if (empty($line) || $line[0] === '#') {
+        $iniFile = dirname(__DIR__) . '/.config.ini';
+        if (file_exists($iniFile)) {
+            $iniContent = parse_ini_file($iniFile, true);
+            if ($iniContent !== false) {
+                // 处理全局配置
+                if (isset($iniContent[0])) {
+                    self::$env = $iniContent[0];
+                }
+                // 其他配置也添加到全局
+                foreach ($iniContent as $key => $value) {
+                    if (is_array($value)) {
+                        // 跳过访问密钥部分，由 parseAccessKeys 处理
                         continue;
                     }
-                    $pos = strpos($line, '=');
-                    if ($pos !== false) {
-                        $key = trim(substr($line, 0, $pos));
-                        $value = trim(substr($line, $pos + 1));
-                        if (strlen($value) >= 2 && $value[0] === '"' && $value[-1] === '"') {
-                            $value = substr($value, 1, -1);
+                    self::$env[$key] = $value;
+                }
+            }
+        }
+    }
+
+    private static function parseAccessKeys(): void
+    {
+        if (self::$accessKeys !== null) {
+            return;
+        }
+
+        self::$accessKeys = [];
+
+        $iniFile = dirname(__DIR__) . '/.config.ini';
+        if (file_exists($iniFile)) {
+            $iniContent = parse_ini_file($iniFile, true);
+            if ($iniContent !== false) {
+                foreach ($iniContent as $section => $value) {
+                    if (is_array($value) && strpos($section, 'keys.') === 0) {
+                        $accessKeyId = substr($section, 5);
+                        
+                        if (!isset($value['secret_key'])) {
+                            continue;
                         }
-                        self::$env[$key] = $value;
+
+                        $accessKey = [
+                            'secret_key' => $value['secret_key'],
+                            'allowed_buckets' => ['*'],
+                            'file_max_size' => 0
+                        ];
+                        
+                        if (isset($value['allowed_buckets'])) {
+                            if ($value['allowed_buckets'] === '*') {
+                                $accessKey['allowed_buckets'] = ['*'];
+                            } else {
+                                $accessKey['allowed_buckets'] = array_map('trim', explode(',', $value['allowed_buckets']));
+                            }
+                        }
+                        
+                        if (isset($value['file_max_size'])) {
+                            $accessKey['file_max_size'] = (int)$value['file_max_size'] * 1024;
+                        }
+                        
+                        self::$accessKeys[$accessKeyId] = $accessKey;
                     }
                 }
             }
@@ -59,7 +102,7 @@ class Config
 
     public static function authDebug(): bool
     {
-        return self::get('AUTH_DEBUG', 'false') === 'true';
+        return self::appDebug();
     }
 
     public static function appDebug(): bool
@@ -67,29 +110,46 @@ class Config
         return self::get('APP_DEBUG', 'false') === 'true';
     }
 
-    public static function maxUploadSize(): int
-    {
-        return (int)self::get('MAX_REQUEST_SIZE', 5 * 1024 * 1024 * 1024);
-    }
-
     public static function isAccessKeyAllowed(string $accessKeyId): bool
     {
-        $allowedKeys = self::get('ALLOWED_ACCESS_KEYS', '');
-        if (empty($allowedKeys)) {
-            return true;
-        }
-
-        $allowedList = array_map('trim', explode(',', $allowedKeys));
-        return in_array($accessKeyId, $allowedList, true);
+        self::parseAccessKeys();
+        return isset(self::$accessKeys[$accessKeyId]);
     }
 
     public static function getSecretKey(string $accessKeyId): ?string
     {
-        if (!self::isAccessKeyAllowed($accessKeyId)) {
+        self::parseAccessKeys();
+        if (!isset(self::$accessKeys[$accessKeyId])) {
             return null;
         }
 
-        return self::get('DEFAULT_SECRET_KEY');
+        return self::$accessKeys[$accessKeyId]['secret_key'] ?? null;
+    }
+
+    public static function isBucketAllowed(string $accessKeyId, string $bucketName): bool
+    {
+        self::parseAccessKeys();
+        if (!isset(self::$accessKeys[$accessKeyId])) {
+            return false;
+        }
+
+        $allowedBuckets = self::$accessKeys[$accessKeyId]['allowed_buckets'] ?? [];
+        
+        if (in_array('*', $allowedBuckets, true)) {
+            return true;
+        }
+        
+        return in_array($bucketName, $allowedBuckets, true);
+    }
+
+    public static function getFileMaxSize(string $accessKeyId): int
+    {
+        self::parseAccessKeys();
+        if (!isset(self::$accessKeys[$accessKeyId])) {
+            return 0;
+        }
+
+        return self::$accessKeys[$accessKeyId]['file_max_size'] ?? 0;
     }
 
     public static function bearerToken(): ?string
