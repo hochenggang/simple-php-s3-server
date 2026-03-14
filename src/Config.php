@@ -4,43 +4,16 @@ namespace S3Gateway;
 
 class Config
 {
-    private static ?array $env = null;
+    private static ?array $config = null;
     private static ?array $accessKeys = null;
 
     private static function load(): void
     {
-        if (self::$env !== null) {
+        if (self::$config !== null) {
             return;
         }
 
-        self::$env = [];
-
-        $iniFile = dirname(__DIR__) . '/.config.ini';
-        if (file_exists($iniFile)) {
-            $iniContent = parse_ini_file($iniFile, true);
-            if ($iniContent !== false) {
-                // 处理全局配置
-                if (isset($iniContent[0])) {
-                    self::$env = $iniContent[0];
-                }
-                // 其他配置也添加到全局
-                foreach ($iniContent as $key => $value) {
-                    if (is_array($value)) {
-                        // 跳过访问密钥部分，由 parseAccessKeys 处理
-                        continue;
-                    }
-                    self::$env[$key] = $value;
-                }
-            }
-        }
-    }
-
-    private static function parseAccessKeys(): void
-    {
-        if (self::$accessKeys !== null) {
-            return;
-        }
-
+        self::$config = [];
         self::$accessKeys = [];
 
         $iniFile = dirname(__DIR__) . '/.config.ini';
@@ -48,7 +21,9 @@ class Config
             $iniContent = parse_ini_file($iniFile, true);
             if ($iniContent !== false) {
                 foreach ($iniContent as $section => $value) {
-                    if (is_array($value) && strpos($section, 'keys.') === 0) {
+                    if ($section === 'general' && is_array($value)) {
+                        self::$config = array_merge(self::$config, $value);
+                    } elseif (is_array($value) && strpos($section, 'keys.') === 0) {
                         $accessKeyId = substr($section, 5);
                         
                         if (!isset($value['secret_key'])) {
@@ -83,7 +58,7 @@ class Config
     public static function get(string $key, $default = null)
     {
         self::load();
-        return self::$env[$key] ?? $_ENV[$key] ?? $_SERVER[$key] ?? $default;
+        return self::$config[$key] ?? $_ENV[$key] ?? $_SERVER[$key] ?? $default;
     }
 
     public static function dataDir(): string
@@ -100,11 +75,6 @@ class Config
         return dirname(__DIR__) . '/' . $path;
     }
 
-    public static function authDebug(): bool
-    {
-        return self::appDebug();
-    }
-
     public static function appDebug(): bool
     {
         return self::get('APP_DEBUG', 'false') === 'true';
@@ -112,13 +82,13 @@ class Config
 
     public static function isAccessKeyAllowed(string $accessKeyId): bool
     {
-        self::parseAccessKeys();
+        self::load();
         return isset(self::$accessKeys[$accessKeyId]);
     }
 
     public static function getSecretKey(string $accessKeyId): ?string
     {
-        self::parseAccessKeys();
+        self::load();
         if (!isset(self::$accessKeys[$accessKeyId])) {
             return null;
         }
@@ -128,7 +98,7 @@ class Config
 
     public static function isBucketAllowed(string $accessKeyId, string $bucketName): bool
     {
-        self::parseAccessKeys();
+        self::load();
         if (!isset(self::$accessKeys[$accessKeyId])) {
             return false;
         }
@@ -144,7 +114,7 @@ class Config
 
     public static function getFileMaxSize(string $accessKeyId): int
     {
-        self::parseAccessKeys();
+        self::load();
         if (!isset(self::$accessKeys[$accessKeyId])) {
             return 0;
         }

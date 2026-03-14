@@ -26,7 +26,7 @@ class Router
     {
         $this->request = new Request();
         $this->response = new Response();
-        $this->authenticator = new Authenticator(Config::authDebug(), $this->request);
+        $this->authenticator = new Authenticator($this->request);
         $this->storage = new FileStorage();
         $this->bucketController = new BucketController($this->storage);
         $this->objectController = new ObjectController($this->storage);
@@ -58,14 +58,28 @@ class Router
 
     private function handleException(S3Exception $e): void
     {
+        $method = $this->request->getMethod();
+        $uri = $this->request->getUri();
+        
         Logger::error(sprintf(
             "S3Exception: %s (Code: %s, HTTP: %d) - %s %s",
             $e->getMessage(),
             $e->getS3Code(),
             $e->getHttpStatus(),
-            $this->request->getMethod(),
-            $this->request->getUri()
+            $method,
+            $uri
         ));
+        
+        // 额外的调试信息，帮助诊断 HEAD 请求问题
+        if (Config::appDebug()) {
+            Logger::debug("[handleException] Request details:");
+            Logger::debug("[handleException]   Reported method: {$method}");
+            Logger::debug("[handleException]   URI: {$uri}");
+            Logger::debug("[handleException]   All headers:");
+            foreach ($this->request->getHeaders() as $name => $value) {
+                Logger::debug("[handleException]     {$name}: {$value}");
+            }
+        }
 
         $xml = XmlResponse::error($e->getS3Code(), $e->getMessage(), $e->getResource());
 

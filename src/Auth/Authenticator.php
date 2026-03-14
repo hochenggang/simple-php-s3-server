@@ -18,7 +18,6 @@ use S3Gateway\Logger;
  */
 class Authenticator
 {
-    private bool $debug;
     private Request $request;
     
     // SigV4 时间戳允许的最大偏差（5分钟，单位：秒）
@@ -30,9 +29,8 @@ class Authenticator
         'te', 'trailer', 'transfer-encoding', 'upgrade', 'x-amzn-trace-id'
     ];
 
-    public function __construct(bool $debug, Request $request)
+    public function __construct(Request $request)
     {
-        $this->debug = $debug;
         $this->request = $request;
     }
 
@@ -154,19 +152,69 @@ class Authenticator
             // 验证时间戳（防止重放攻击）
             $this->validateTimestamp($signatureData);
 
-            // 构建 StringToSign
-            $stringToSign = $this->buildStringToSign($signatureData);
-            $this->logDebug("StringToSign:\n{$stringToSign}");
+            // 获取当前方法
+            $currentMethod = $this->request->getMethod();
+            $this->logDebug("Current request method: {$currentMethod}");
 
-            // 计算签名
-            $calculatedSignature = $this->calculateSignatureV4($stringToSign, $secretKey, $signatureData);
-            $this->logDebug("Calculated Signature: {$calculatedSignature}");
-            $this->logDebug("Provided Signature: {$signatureData['Signature']}");
+            // 我们需要尝试的方法列表
+            $methodsToTry = [$currentMethod];
+            
+            // HEAD/GET 请求兼容性处理
+            // Apache 和某些 Web 服务器可能会将 HEAD 请求转换为 GET 请求
+            // 这会导致签名验证失败，因为客户端使用 HEAD 签名，但服务器收到的是 GET
+            // 反之亦然，如果服务器收到 HEAD，但客户端使用 GET 签名，也会失败
+            if ($currentMethod === 'GET' || $currentMethod === 'HEAD') {
+                $alternateMethod = ($currentMethod === 'GET') ? 'HEAD' : 'GET';
+                $methodsToTry[] = $alternateMethod;
+                $this->logDebug("Also trying method: {$alternateMethod} (HEAD/GET compatibility fallback)");
+            }
+
+            $signatureVerified = false;
+            $lastCalculatedSignature = null;
+            $lastStringToSign = null;
+            $verifiedMethod = null;
+
+            foreach ($methodsToTry as $method) {
+                $this->logDebug("Trying authentication with method: {$method}");
+                
+                try {
+                    // 构建 StringToSign，使用 overrideMethod 参数
+                    $stringToSign = $this->buildStringToSign($signatureData, $method);
+                    $this->logDebug("StringToSign for method {$method}:\n{$stringToSign}");
+                    
+                    // 计算签名
+                    $calculatedSignature = $this->calculateSignatureV4($stringToSign, $secretKey, $signatureData);
+                    $this->logDebug("Calculated Signature for {$method}: {$calculatedSignature}");
+                    $this->logDebug("Provided Signature: {$signatureData['Signature']}");
+                    
+                    // 保存最后一次计算的结果
+                    $lastCalculatedSignature = $calculatedSignature;
+                    $lastStringToSign = $stringToSign;
+                    
+                    // 验证签名
+                    if (hash_equals($calculatedSignature, $signatureData['Signature'])) {
+                        $this->logDebug("Signature verified successfully with method: {$method}");
+                        $signatureVerified = true;
+                        $verifiedMethod = $method;
+                        break;
+                    }
+                } catch (\Exception $e) {
+                    $this->logDebug("Error trying method {$method}: " . $e->getMessage());
+                }
+            }
 
             // 验证签名
-            if (!hash_equals($calculatedSignature, $signatureData['Signature'])) {
-                $this->logSignatureMismatch($signatureData, $stringToSign, $calculatedSignature);
+            if (!$signatureVerified) {
+                if ($lastStringToSign !== null && $lastCalculatedSignature !== null) {
+                    $this->logSignatureMismatch($signatureData, $lastStringToSign, $lastCalculatedSignature);
+                }
                 throw S3Exception::signatureDoesNotMatch();
+            }
+
+            // 如果使用了 alternate method 验证成功，记录警告
+            if ($verifiedMethod !== null && $verifiedMethod !== $currentMethod) {
+                $this->logDebug("WARNING: Signature verified with {$verifiedMethod} but request method is {$currentMethod}");
+                $this->logDebug("This suggests a HEAD/GET conversion issue by the web server");
             }
 
             $this->logDebug("Signature verified successfully");
@@ -265,20 +313,33 @@ class Authenticator
     /**
      * 构建 StringToSign
      */
-    private function buildStringToSign(array $signatureData): string
+    private function buildStringToSign(array $signatureData, ?string $overrideMethod = null): string
     {
-        $method = $this->request->getMethod();
+        $method = $overrideMethod ?? $this->request->getMethod();
         $uri = $this->request->getUri();
         $queryString = $this->request->getQueryString();
         $headers = $this->request->getHeaders();
         $body = $this->request->getBody();
+
+        $this->logDebug("=== buildStringToSign ===");
+        $this->logDebug("Request method: {$method}" . ($overrideMethod ? " (overridden)" : ""));
+        $this->logDebug("Request URI: {$uri}");
+        
+        // 额外的调试信息 - 检查是否有可能这是一个被转换为 GET 的 HEAD 请求
+        if ($method === 'GET') {
+            // 检查是否有任何线索表明这可能是一个 HEAD 请求
+            // 例如，检查是否存在没有请求体但有 Content-Length 为 0 等情况
+            $contentLength = $this->findHeader($headers, 'content-length');
+            $this->logDebug("GET request check - Content-Length: " . ($contentLength ?? 'not set'));
+            $this->logDebug("GET request check - Body length: " . strlen($body));
+        }
 
         // 构建规范请求的各个部分
         $canonicalUri = $this->encodeUri($uri);
         $canonicalQueryString = $this->normalizeQueryString($queryString);
         $canonicalHeaders = $this->buildCanonicalHeaders($headers, $signatureData['SignedHeaders']);
         $signedHeaders = strtolower($signatureData['SignedHeaders']);
-        $hashedPayload = $this->getPayloadHash($headers, $body);
+        $hashedPayload = $this->getPayloadHash($headers, $body, $method);
 
         $this->logDebug("Canonical URI: {$canonicalUri}");
         $this->logDebug("Canonical Query String: {$canonicalQueryString}");
@@ -313,6 +374,8 @@ class Authenticator
             $scope,
             hash('sha256', $canonicalRequest),
         ]);
+
+        $this->logDebug("=== End buildStringToSign ===");
 
         return $stringToSign;
     }
@@ -375,16 +438,30 @@ class Authenticator
     /**
      * 获取请求体哈希
      */
-    private function getPayloadHash(array $headers, string $body): string
+    private function getPayloadHash(array $headers, string $body, ?string $overrideMethod = null): string
     {
         // 优先使用 x-amz-content-sha256 头部
         $contentSha256 = $this->findHeader($headers, 'x-amz-content-sha256');
         if ($contentSha256 !== null) {
+            $this->logDebug("Using x-amz-content-sha256: {$contentSha256}");
             return $contentSha256;
         }
 
-        // 计算请求体的 SHA256
-        return hash('sha256', $body);
+        $method = $overrideMethod ?? $this->request->getMethod();
+        
+        // 对于没有请求体的请求（HEAD、GET、DELETE），
+        // 确保始终使用空字符串的 SHA256，避免偶发性不一致
+        $emptyPayloadMethods = ['HEAD', 'GET', 'DELETE'];
+        if (in_array($method, $emptyPayloadMethods)) {
+            $this->logDebug("Method {$method} has no body, using empty payload hash");
+            // 空字符串的 SHA256 哈希
+            return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+        }
+
+        // 对于其他请求，计算请求体的 SHA256
+        $hash = hash('sha256', $body);
+        $this->logDebug("Calculated payload hash for {$method} request: {$hash}");
+        return $hash;
     }
 
     /**
@@ -528,19 +605,67 @@ class Authenticator
                 throw S3Exception::invalidAccessKeyId();
             }
 
-            // 构建 StringToSign
-            $stringToSign = $this->buildPresignedUrlStringToSign($presignedData);
-            $this->logDebug("Presigned URL StringToSign:\n{$stringToSign}");
+            // 获取当前方法
+            $currentMethod = $this->request->getMethod();
+            $this->logDebug("Current request method: {$currentMethod}");
 
-            // 计算签名
-            $calculatedSignature = $this->calculatePresignedUrlSignature($stringToSign, $secretKey, $presignedData);
-            $this->logDebug("Calculated Signature: {$calculatedSignature}");
-            $this->logDebug("Provided Signature: {$presignedData['Signature']}");
+            // HEAD/GET 请求兼容性处理
+            $methodsToTry = [$currentMethod];
+            if ($currentMethod === 'GET' || $currentMethod === 'HEAD') {
+                $alternateMethod = ($currentMethod === 'GET') ? 'HEAD' : 'GET';
+                $methodsToTry[] = $alternateMethod;
+                $this->logDebug("Also trying method: {$alternateMethod} (HEAD/GET compatibility fallback)");
+            }
+
+            $signatureVerified = false;
+            $lastCalculatedSignature = null;
+            $lastStringToSign = null;
+            $verifiedMethod = null;
+
+            foreach ($methodsToTry as $method) {
+                $this->logDebug("Trying presigned URL authentication with method: {$method}");
+                
+                try {
+                    // 构建 StringToSign，使用 overrideMethod 参数
+                    $stringToSign = $this->buildPresignedUrlStringToSign($presignedData, $method);
+                    $this->logDebug("Presigned URL StringToSign for method {$method}:\n{$stringToSign}");
+
+                    // 计算签名
+                    $calculatedSignature = $this->calculatePresignedUrlSignature($stringToSign, $secretKey, $presignedData);
+                    $this->logDebug("Calculated Signature for {$method}: {$calculatedSignature}");
+                    $this->logDebug("Provided Signature: {$presignedData['Signature']}");
+                    
+                    // 保存最后一次计算的结果
+                    $lastCalculatedSignature = $calculatedSignature;
+                    $lastStringToSign = $stringToSign;
+                    
+                    // 验证签名
+                    if (hash_equals($calculatedSignature, $presignedData['Signature'])) {
+                        $this->logDebug("Presigned URL signature verified successfully with method: {$method}");
+                        $signatureVerified = true;
+                        $verifiedMethod = $method;
+                        break;
+                    }
+                } catch (\Exception $e) {
+                    $this->logDebug("Error trying presigned URL method {$method}: " . $e->getMessage());
+                }
+            }
 
             // 验证签名
-            if (!hash_equals($calculatedSignature, $presignedData['Signature'])) {
-                $this->logDebug("Presigned URL signature mismatch");
+            if (!$signatureVerified) {
+                if ($lastStringToSign !== null && $lastCalculatedSignature !== null) {
+                    $this->logDebug("Presigned URL signature mismatch");
+                    $this->logDebug("Expected: {$lastCalculatedSignature}");
+                    $this->logDebug("Got: {$presignedData['Signature']}");
+                    $this->logDebug("StringToSign:\n{$lastStringToSign}");
+                }
                 throw S3Exception::signatureDoesNotMatch();
+            }
+
+            // 如果使用了 alternate method 验证成功，记录警告
+            if ($verifiedMethod !== null && $verifiedMethod !== $currentMethod) {
+                $this->logDebug("WARNING: Presigned URL signature verified with {$verifiedMethod} but request method is {$currentMethod}");
+                $this->logDebug("This suggests a HEAD/GET conversion issue by web server");
             }
 
             $this->logDebug("Presigned URL signature verified successfully");
@@ -632,9 +757,9 @@ class Authenticator
     /**
      * 构建预签名 URL 的 StringToSign
      */
-    private function buildPresignedUrlStringToSign(array $presignedData): string
+    private function buildPresignedUrlStringToSign(array $presignedData, ?string $overrideMethod = null): string
     {
-        $method = $this->request->getMethod();
+        $method = $overrideMethod ?? $this->request->getMethod();
         $uri = $this->request->getUri();
         $queryString = $this->request->getQueryString();
         $headers = $this->request->getHeaders();
@@ -670,7 +795,7 @@ class Authenticator
             hash('sha256', $canonicalRequest),
         ]);
 
-        if ($this->debug) {
+        if (Config::appDebug()) {
             $this->logDebug("Presigned URL CanonicalRequest:\n{$canonicalRequest}");
         }
 
@@ -795,7 +920,7 @@ class Authenticator
      */
     private function logSignatureMismatch(array $signatureData, string $stringToSign, string $calculatedSignature): void
     {
-        if (!$this->debug) {
+        if (!Config::appDebug()) {
             return;
         }
 
@@ -817,7 +942,7 @@ class Authenticator
      */
     private function logDebug(string $message): void
     {
-        if ($this->debug) {
+        if (Config::appDebug()) {
             Logger::debug("[Authenticator] {$message}");
         }
     }

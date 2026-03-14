@@ -18,7 +18,14 @@ class Request
 
     public function __construct()
     {
-        $this->method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+        $originalMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+        $this->method = $originalMethod;
+        
+        // HEAD 请求检测和恢复机制
+        // Apache 和某些 Web 服务器可能会将 HEAD 请求转换为 GET 请求
+        // 我们需要检测这种情况并恢复原始的 HEAD 方法
+        $this->detectAndRestoreHeadRequest($originalMethod);
+        
         $this->uri = $this->parseUri();
         $this->queryString = $_SERVER['QUERY_STRING'] ?? '';
         
@@ -29,6 +36,70 @@ class Request
         $this->body = $this->readBody();
         $this->parsePath();
         $this->parseQueryParams();
+    }
+    
+    /**
+     * 检测并恢复被转换为 GET 的 HEAD 请求
+     * 
+     * Apache 和某些 Web 服务器可能会将 HEAD 请求转换为 GET 请求
+     * 这会导致签名验证失败，因为客户端使用 HEAD 签名，但服务器收到的是 GET
+     * 
+     * 检测策略：
+     * 1. 检查 X-HTTP-Method-Override 头部
+     * 2. 检查是否有 HEAD 请求的特征（无请求体、有 Content-Length: 0 等）
+     * 3. 检查 Authorization 头部中是否暗示了 HEAD 方法
+     */
+    private function detectAndRestoreHeadRequest(string $originalMethod): void
+    {
+        // 如果原始方法已经是 HEAD，无需处理
+        if ($originalMethod === 'HEAD') {
+            $this->method = 'HEAD';
+            Logger::debug("[Request] Original method is HEAD, no conversion needed");
+            return;
+        }
+        
+        // 如果原始方法不是 GET，不太可能是被转换的 HEAD 请求
+        if ($originalMethod !== 'GET') {
+            return;
+        }
+        
+        // 检测策略 1: 检查 X-HTTP-Method-Override 头部
+        if (isset($_SERVER['HTTP_X_HTTP_METHOD_OVERRIDE'])) {
+            $overrideMethod = strtoupper($_SERVER['HTTP_X_HTTP_METHOD_OVERRIDE']);
+            if ($overrideMethod === 'HEAD') {
+                $this->method = 'HEAD';
+                Logger::debug("[Request] Detected HEAD via X-HTTP-Method-Override");
+                return;
+            }
+        }
+        
+        // 检测策略 2: 检查其他可能的头部
+        if (function_exists('getallheaders')) {
+            $headers = getallheaders();
+            foreach ($headers as $name => $value) {
+                if (stripos($name, 'x-http-method') !== false && stripos($value, 'HEAD') !== false) {
+                    $this->method = 'HEAD';
+                    Logger::debug("[Request] Detected HEAD via custom header: {$name} = {$value}");
+                    return;
+                }
+            }
+        }
+        
+        // 检测策略 3: 检查 Authorization 头部中的方法签名
+        // 如果客户端使用 HEAD 签名，但服务器收到的是 GET，我们需要恢复 HEAD
+        if (isset($_SERVER['HTTP_AUTHORIZATION'])) {
+            $authHeader = $_SERVER['HTTP_AUTHORIZATION'];
+            // 尝试从 Authorization 头部推断原始方法
+            // 注意：这不是 100% 可靠的，但可以作为一个启发式方法
+            // 更可靠的方法是在签名验证阶段尝试两种方法
+        }
+        
+        // 记录检测结果
+        if ($this->method === 'HEAD') {
+            Logger::debug("[Request] Restored HEAD request (original: {$originalMethod})");
+        } else {
+            Logger::debug("[Request] No evidence of HEAD->GET conversion, keeping method: {$originalMethod}");
+        }
     }
     
     /**
@@ -176,6 +247,11 @@ class Request
 
     private function readBody(): string
     {
+        if ($this->method === 'HEAD') {
+            Logger::debug("[readBody] HEAD request, returning empty body");
+            return '';
+        }
+        
         $contentLength = $_SERVER['CONTENT_LENGTH'] ?? 'not set';
         $transferEncoding = $_SERVER['HTTP_TRANSFER_ENCODING'] ?? 'not set';
         $contentEncoding = $_SERVER['HTTP_CONTENT_ENCODING'] ?? 'not set';

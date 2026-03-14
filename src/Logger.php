@@ -40,7 +40,7 @@ class Logger
 
     public static function debug(string $message): void
     {
-        if (Config::authDebug()) {
+        if (Config::appDebug()) {
             self::log($message, 'DEBUG');
         }
     }

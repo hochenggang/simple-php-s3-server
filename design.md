@@ -7,11 +7,13 @@ Implement a pure local filesystem-based S3-compatible API gateway using PHP.
 ## Supported Operations
 
 ### Bucket
+
 - List
 - Create
 - Delete
 
 ### Object
+
 - Put
 - Get
 - Head
@@ -20,6 +22,7 @@ Implement a pure local filesystem-based S3-compatible API gateway using PHP.
 - List
 
 ### Multipart Upload
+
 - Create
 - UploadPart
 - Complete
@@ -30,11 +33,15 @@ Implement a pure local filesystem-based S3-compatible API gateway using PHP.
 
 **Keep it minimal.** Advanced features such as ACL, versioning, and other non-essential functionalities are explicitly excluded.
 
+Full suport for S3V4 Sign Authorization for headers.**authorization.**
+
+Particial surport for of presign url authorization of GET object requests.
+
 ## Storage Layout
 
-| Type | Path |
-|------|------|
-| Objects | `{base_path}/{bucket}/{key}` |
+| Type            | Path                                                      |
+| --------------- | --------------------------------------------------------- |
+| Objects         | `{base_path}/{bucket}/{key}`                              |
 | Multipart Parts | `{base_path}/{bucket}/.multipart/{uploadId}/{partNumber}` |
 
 ## Metadata Strategy
@@ -47,3 +54,4 @@ Implement a pure local filesystem-based S3-compatible API gateway using PHP.
 - **Robust Authentication:** Secure and standards-compliant auth
 - **Reliable Transfer:** Handle data transmission correctly
 - **Clean Code:** Write elegant, maintainable code
+
