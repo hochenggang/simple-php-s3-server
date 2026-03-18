@@ -69,8 +69,10 @@ The configuration is stored in `.config.ini` file with INI format:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DATA_DIR` | Data storage directory | `./data` |
+| `DATA_DIR` | Data storage directory | `../data` |
 | `APP_DEBUG` | Application debug mode | `false` |
+
+Do not put `DATA_DIR` in the same directory as the gateway files. It is recommended to put it in a parent directory to avoid exposing the storage directory.
 
 ### Access Keys Configuration
 
@@ -97,7 +99,7 @@ file_max_size=10240
 
 ## Storage
 
-Objects are stored at: `./data/{bucket}/{key}`
+Objects are stored at: `../data/{bucket}/{key}`
 
 ## Known Limitations
 

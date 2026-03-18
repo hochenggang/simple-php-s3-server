@@ -70,8 +70,10 @@ s3.download_file('bucket', 'remote.txt', 'local.txt')
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `DATA_DIR` | 数据存储目录 | `./data` |
+| `DATA_DIR` | 数据存储目录 | `../data` |
 | `APP_DEBUG` | 应用调试模式 | `false` |
+
+**注意**：`DATA_DIR` 目录**不能**与网关文件在同一目录下。建议将其放在父目录下，避免暴露存储目录。
 
 ### 访问密钥配置
 
@@ -98,7 +100,7 @@ file_max_size=10240
 
 ## 存储
 
-对象存储在：`./data/{bucket}/{key}`
+对象存储在：`../data/{bucket}/{key}`
 
 ## 已知限制
 

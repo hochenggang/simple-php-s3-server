@@ -1,8 +1,7 @@
 <IfModule mod_headers.c>
     Header always set Access-Control-Allow-Origin "*"
     Header always set Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS, HEAD"
-    Header always set Access-Control-Allow-Headers "Authorization, X-AMZ-Content-Sha256, X-Amz-Copy-Source, X-Amz-Date, X-Amz-User-Agent, Content-Type, Content-Length, Content-MD5, Content-Disposition, X-Requested-With, Accept, Origin, Cache-Control"
-    Header always set Access-Control-Expose-Headers "Content-Length, Content-Type, ETag, Last-Modified"
+    Header always set Access-Control-Allow-Headers "*"
     Header always set Access-Control-Max-Age "86400"
 </IfModule>
 
@@ -13,10 +12,6 @@
     RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
 
     RewriteRule ^.multipart/ - [F,L]
-    RewriteRule ^\.env - [F,L]
-    RewriteRule ^\.env\.example - [F,L]
-    RewriteCond %{REQUEST_FILENAME} !-f
-    RewriteCond %{REQUEST_FILENAME} !-d
 
     RewriteRule ^(.*)$ index.php [L,QSA]
 </IfModule>
