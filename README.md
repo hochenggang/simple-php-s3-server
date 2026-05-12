@@ -99,7 +99,7 @@ file_max_size=10240
 
 ## Storage
 
-Objects are stored at: `../data/{bucket}/{key}`
+Objects are stored at: `DATA_DIR/{bucket}/{key}`
 
 ## Known Limitations
 
