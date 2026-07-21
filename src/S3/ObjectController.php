@@ -6,12 +6,9 @@ use S3Gateway\Exception\S3Exception;
 use S3Gateway\Http\Request;
 use S3Gateway\Http\Response;
 use S3Gateway\Storage\FileStorage;
-use S3Gateway\Logger;
 
 class ObjectController
 {
-    private const MEMORY_THRESHOLD = 5 * 1024 * 1024;
-
     private FileStorage $storage;
 
     public function __construct(FileStorage $storage)
@@ -37,7 +34,7 @@ class ObjectController
         }
 
         $copySource = $request->getHeader('X-Amz-Copy-Source');
-        
+
         if ($copySource) {
             $this->handleCopyObject($copySource, $bucket, $key, $response);
             return;
@@ -49,10 +46,14 @@ class ObjectController
             throw S3Exception::internalError('Failed to write object file', "/{$bucket}/{$key}");
         }
 
-        $etag = $this->storage->getMetaReader()->calculateEtag($key, strlen($body));
+        $etag = $this->storage->getMetaReader()->calculateEtag(
+            $this->storage->getPathResolver()->canonicalizeKey($key),
+            strlen($body)
+        );
 
         $response
             ->setHeader('ETag', '"' . $etag . '"')
+            ->setHeader('Content-Type', 'application/xml')
             ->sendEmpty(200);
     }
 
@@ -69,8 +70,8 @@ class ObjectController
         $sourceBucket = $sourceParts[0];
         $sourceKey = $sourceParts[1];
 
-        if (strpos($sourceKey, '?versionId=') !== false) {
-            list($sourceKey, ) = explode('?versionId=', $sourceKey, 2);
+        if (str_contains($sourceKey, '?versionId=')) {
+            [$sourceKey, ] = explode('?versionId=', $sourceKey, 2);
         }
 
         $sourcePath = $this->storage->getPathResolver()->objectPath($sourceBucket, $sourceKey);
@@ -89,7 +90,10 @@ class ObjectController
             throw S3Exception::internalError('Failed to read object metadata', "/{$destBucket}/{$destKey}");
         }
 
-        $etag = $this->storage->getMetaReader()->calculateEtag($destKey, $meta['size']);
+        $etag = $this->storage->getMetaReader()->calculateEtag(
+            $this->storage->getPathResolver()->canonicalizeKey($destKey),
+            $meta['size']
+        );
         $lastModified = $meta['mtime'];
 
         $xml = XmlResponse::copyObject('"' . $etag . '"', $lastModified);
@@ -109,30 +113,35 @@ class ObjectController
             throw S3Exception::invalidRequest('Bucket and key required');
         }
 
+        if (!$this->storage->bucketExists($bucket)) {
+            throw S3Exception::noSuchBucket('/' . $bucket);
+        }
+
         $filePath = $this->storage->getPathResolver()->objectPath($bucket, $key);
 
-        if (!file_exists($filePath)) {
+        // is_file covers both "not exists" and "is a directory" (key maps to a folder).
+        if (!is_file($filePath)) {
             throw S3Exception::noSuchKey("/{$bucket}/{$key}");
         }
 
-        $fileSize = $this->storage->getMetaReader()->getFileSize($filePath);
-
-        if ($fileSize === 0 && filesize($filePath) !== 0) {
-            clearstatcache(true, $filePath);
-            $fileSize = filesize($filePath);
+        $meta = $this->storage->getObjectMeta($bucket, $key);
+        if ($meta === null) {
+            throw S3Exception::noSuchKey("/{$bucket}/{$key}");
         }
 
+        $fileSize = $meta['size'];
         $rangeHeader = $request->getHeader('Range') ?? '';
         $options = [
-            'filename' => basename(rawurldecode($key))
+            'filename' => basename(rawurldecode($key)),
+            'mime' => $meta['mime'],
+            'etag' => $meta['etag'],
+            'lastModified' => $meta['mtime'],
         ];
 
         if ($rangeHeader) {
             $rangeInfo = $this->parseRangeHeader($rangeHeader, $fileSize);
 
             if ($rangeInfo === null) {
-                http_response_code(416);
-                header("Content-Range: bytes */{$fileSize}");
                 throw S3Exception::rangeNotSatisfiable("/{$bucket}/{$key}");
             }
 
@@ -150,7 +159,7 @@ class ObjectController
 
         if (preg_match('/^bytes=(\d+)-(\d*)$/', $rangeHeader, $matches)) {
             $start = (int)$matches[1];
-            
+
             if ($matches[2] !== '') {
                 $end = (int)$matches[2];
             } else {
@@ -175,8 +184,10 @@ class ObjectController
         if (preg_match('/^bytes=-(\d+)$/', $rangeHeader, $matches)) {
             $suffix = (int)$matches[1];
 
+            // bytes=-0 means "last 0 bytes" → unsatisfiable (RFC 7233). Return null
+            // so the caller emits 416 instead of serving the whole file as 206.
             if ($suffix <= 0) {
-                $suffix = $fileSize;
+                return null;
             }
 
             if ($suffix > $fileSize) {
@@ -195,25 +206,31 @@ class ObjectController
         $bucket = $request->getBucket();
         $key = $request->getKey();
 
-        Logger::debug("[headObject] bucket={$bucket}, key={$key}");
-
         if (empty($bucket) || empty($key)) {
             throw S3Exception::invalidRequest('Bucket and key required');
+        }
+
+        if (!$this->storage->bucketExists($bucket)) {
+            throw S3Exception::noSuchBucket('/' . $bucket);
         }
 
         $meta = $this->storage->getObjectMeta($bucket, $key);
 
         if ($meta === null) {
-            Logger::debug("[headObject] Object not found: /{$bucket}/{$key}");
             throw S3Exception::noSuchKey("/{$bucket}/{$key}");
         }
 
-        Logger::debug("[headObject] Returning headers: Content-Length={$meta['size']}, ETag={$meta['etag']}");
+        // Mirror GET's Content-Disposition so HEAD exposes the same metadata.
+        $filename = basename(rawurldecode($key));
+        $asciiFallback = preg_replace('/[^\x20-\x7e]/', '_', $filename);
+        $asciiFallback = str_replace('"', '\\"', $asciiFallback);
+        $disposition = 'inline; filename="' . $asciiFallback . '"; filename*=UTF-8\'\'' . rawurlencode($filename);
 
         $response
             ->setHeader('Content-Length', (string)$meta['size'])
             ->setHeader('Content-Type', $meta['mime'])
-            ->setHeader('Last-Modified', gmdate('D, d M Y H:i:s T', $meta['mtime']))
+            ->setHeader('Content-Disposition', $disposition)
+            ->setHeader('Last-Modified', gmdate('D, d M Y H:i:s \G\M\T', $meta['mtime']))
             ->setHeader('ETag', '"' . $meta['etag'] . '"')
             ->setHeader('Accept-Ranges', 'bytes')
             ->sendEmpty(200);
@@ -226,6 +243,10 @@ class ObjectController
 
         if (empty($bucket)) {
             throw S3Exception::invalidBucketName();
+        }
+
+        if (!$this->storage->bucketExists($bucket)) {
+            throw S3Exception::noSuchBucket('/' . $bucket);
         }
 
         if (empty($key)) {
@@ -257,14 +278,26 @@ class ObjectController
             throw S3Exception::invalidXML();
         }
 
+        $objectCount = count($xml->Object);
+        if ($objectCount > 1000) {
+            throw S3Exception::invalidRequest('Cannot delete more than 1000 keys in a single request');
+        }
+
         $deleted = [];
         $errors = [];
+        $seen = [];
 
         foreach ($xml->Object as $object) {
             $key = (string)($object->Key ?? '');
             if (empty($key)) {
                 continue;
             }
+
+            // Deduplicate: a repeated Key should appear only once in the response.
+            if (isset($seen[$key])) {
+                continue;
+            }
+            $seen[$key] = true;
 
             if ($this->storage->objectExists($bucket, $key)) {
                 if ($this->storage->deleteObject($bucket, $key)) {

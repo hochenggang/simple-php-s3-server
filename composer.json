@@ -1,0 +1,23 @@
+{
+    "name": "simple-php-s3-server/s3-gateway",
+    "description": "A simple S3-compatible API gateway based on local filesystem",
+    "type": "project",
+    "require": {
+        "php": "^8.1",
+        "spatie/array-to-xml": "^3.4",
+        "symfony/filesystem": "^6.4"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "S3Gateway\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "S3Gateway\\Tests\\": "tests/"
+        }
+    }
+}

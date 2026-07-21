@@ -31,7 +31,6 @@ class Response
 
     public function send(): void
     {
-        // 调试模式：记录响应信息
         $this->logResponse();
 
         http_response_code($this->statusCode);
@@ -44,7 +43,7 @@ class Response
     }
 
     /**
-     * 记录响应信息，用于调试
+     * Log response info in debug mode
      */
     private function logResponse(): void
     {
@@ -52,44 +51,7 @@ class Response
             return;
         }
 
-        Logger::debug("[Response] ========== Response Start ==========");
-        Logger::debug("[Response] Status Code: {$this->statusCode}");
-
-        // 记录所有响应头部
-        Logger::debug("[Response] --- Response Headers ---");
-        if (empty($this->headers)) {
-            Logger::debug("[Response]   (No custom headers set)");
-        } else {
-            foreach ($this->headers as $name => $value) {
-                Logger::debug("[Response]   {$name}: {$value}");
-            }
-        }
-
-        // 记录响应体信息
-        $bodyLength = strlen($this->body);
-        Logger::debug("[Response] --- Response Body ---");
-        Logger::debug("[Response]   Body Length: {$bodyLength} bytes");
-
-        // 如果响应体较小（小于 1000 字节），记录完整内容
-        if ($bodyLength > 0 && $bodyLength < 1000) {
-            // 截断并清理内容以便日志记录
-            $preview = substr($this->body, 0, 500);
-            $preview = str_replace(["\r", "\n"], ['\r', '\n'], $preview);
-            Logger::debug("[Response]   Body Preview: {$preview}");
-        } elseif ($bodyLength >= 1000) {
-            $preview = substr($this->body, 0, 200);
-            $preview = str_replace(["\r", "\n"], ['\r', '\n'], $preview);
-            Logger::debug("[Response]   Body Preview (first 200 chars): {$preview}...");
-        } else {
-            Logger::debug("[Response]   Body: (empty)");
-        }
-
-        // 记录 Content-Type（如果已设置）
-        if (isset($this->headers['Content-Type'])) {
-            Logger::debug("[Response]   Content-Type: {$this->headers['Content-Type']}");
-        }
-
-        Logger::debug("[Response] ========== Response End ==========");
+        Logger::debug("[Response] Status: {$this->statusCode}, Body: " . strlen($this->body) . " bytes");
     }
 
     public function sendEmpty(int $statusCode = 204): void
@@ -97,21 +59,13 @@ class Response
         $this->statusCode = $statusCode;
         http_response_code($this->statusCode);
 
-        Logger::debug("[sendEmpty] Sending headers for status {$statusCode}:");
-        // Send headers, ensuring Content-Length is preserved
         foreach ($this->headers as $name => $value) {
-            Logger::debug("[sendEmpty]   {$name}: {$value}");
             header("{$name}: {$value}", true);
         }
-        Logger::debug("[sendEmpty] Headers sent");
     }
 
     public function sendFile(string $filePath, array $options = []): void
     {
-        while (ob_get_level() > 0) {
-            @ob_end_clean();
-        }
-
         if (!file_exists($filePath)) {
             http_response_code(404);
             header('Content-Type: text/plain');
@@ -129,9 +83,29 @@ class Response
             return;
         }
 
+        // Open the file BEFORE emitting any headers so a fopen failure can still
+        // produce a clean 500 without a stale Content-Length confusing the client.
+        $fp = fopen($filePath, 'rb');
+        if ($fp === false) {
+            http_response_code(500);
+            header('Content-Type: text/plain');
+            echo 'Failed to open file';
+            return;
+        }
+
         $start = $options['start'] ?? 0;
         $end = $options['end'] ?? ($fileSize - 1);
         $partial = $options['partial'] ?? false;
+
+        if ($start > 0) {
+            if (fseek($fp, $start) !== 0) {
+                fclose($fp);
+                http_response_code(500);
+                header('Content-Type: text/plain');
+                echo 'Seek failed';
+                return;
+            }
+        }
 
         if ($partial) {
             $statusCode = 206;
@@ -147,24 +121,33 @@ class Response
         $mimeType = $options['mime'] ?? $this->detectMimeType($filePath);
         $filename = $options['filename'] ?? basename($filePath);
 
+        // RFC 6266 Content-Disposition: ASCII fallback (quoted) + UTF-8 filename*
+        // for non-ASCII names. Avoids the incomplete '"'→'\\"' escaping of the
+        // previous implementation which left backslashes and control chars loose.
+        $asciiFallback = preg_replace('/[^\x20-\x7e]/', '_', $filename);
+        $asciiFallback = str_replace('"', '\\"', $asciiFallback);
+        $disposition = 'inline; filename="' . $asciiFallback . '"; filename*=UTF-8\'\'' . rawurlencode($filename);
+
         http_response_code($statusCode);
         header('Content-Type: ' . $mimeType);
         header('Accept-Ranges: bytes');
-        header('Content-Disposition: inline; filename="' . $filename . '"');
+        header('Content-Disposition: ' . $disposition);
         header($contentLengthHeader);
         if ($contentRange !== null) {
             header($contentRange);
         }
 
-        $fp = fopen($filePath, 'rb');
-        if ($fp === false) {
-            http_response_code(500);
-            echo 'Failed to open file';
-            return;
+        // Metadata headers (kept consistent with HEAD responses).
+        if (isset($options['etag']) && $options['etag'] !== '') {
+            $etag = $options['etag'];
+            if (!str_starts_with($etag, '"')) {
+                $etag = '"' . $etag . '"';
+            }
+            header('ETag: ' . $etag);
         }
-
-        if ($start > 0) {
-            fseek($fp, $start);
+        if (isset($options['lastModified'])) {
+            // RFC 7232 HTTP-date requires a literal "GMT" suffix; PHP's "T" yields "UTC".
+            header('Last-Modified: ' . gmdate('D, d M Y H:i:s \G\M\T', (int)$options['lastModified']));
         }
 
         $bufferSize = 65536;

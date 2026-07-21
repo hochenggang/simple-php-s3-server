@@ -8,22 +8,20 @@ use S3Gateway\Http\Request;
 use S3Gateway\Logger;
 
 /**
- * AWS Signature Version 4 (SigV4) 认证器
- * 
- * 严格遵循 AWS SigV4 规范实现，支持：
- * - 标准 Authorization Header 认证
- * - 预签名 URL 认证
- * - CloudFront/Cloudflare 代理适配
- * - 完整调试日志
+ * AWS Signature Version 4 (SigV4) authenticator
+ *
+ * Supports:
+ * - AWS4-HMAC-SHA256 Authorization Header
+ * - Presigned URL (X-Amz-Credential query param)
+ * - AWS Signature V2 (legacy)
+ * - Bearer Token
  */
 class Authenticator
 {
     private Request $request;
-    
-    // SigV4 时间戳允许的最大偏差（5分钟，单位：秒）
+
     private const MAX_TIMESTAMP_SKEW = 300;
-    
-    // Hop-by-hop 头部 - 不应包含在签名中
+
     private const HOP_BY_HOP_HEADERS = [
         'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
         'te', 'trailer', 'transfer-encoding', 'upgrade', 'x-amzn-trace-id'
@@ -35,237 +33,114 @@ class Authenticator
     }
 
     /**
-     * 执行认证
-     * @return string 返回 accessKeyId
+     * Execute authentication
+     * @return string Returns the accessKeyId
      */
     public function authenticate(): string
     {
         $authHeader = $this->request->getHeader('Authorization');
-        
-        $this->logDebug("=== Authentication Start ===");
-        $this->logDebug("Request Method: " . $this->request->getMethod());
-        $this->logDebug("Request URI: " . $this->request->getUri());
-        $this->logDebug("Query String: " . $this->request->getQueryString());
-        $this->logDebug("Authorization Header: " . ($authHeader ?? 'null'));
 
         if ($this->isPresignedUrlRequest()) {
-            $this->logDebug("Detected presigned URL request");
             $accessKeyId = $this->authenticatePresignedUrl();
             $this->checkBucketPermission($accessKeyId);
-            $this->logDebug("=== Authentication Success (Presigned URL) ===");
             return $accessKeyId;
         }
 
         if (empty($authHeader)) {
-            $this->logDebug("No Authorization header found");
             throw S3Exception::accessDenied();
         }
 
         $accessKeyId = null;
-        if (strpos($authHeader, 'AWS4-HMAC-SHA256') === 0) {
-            $this->logDebug("Detected AWS4-HMAC-SHA256 signature");
+        if (str_starts_with($authHeader, 'AWS4-HMAC-SHA256')) {
             $accessKeyId = $this->authenticateAwsSignatureV4($authHeader);
-        } elseif (strpos($authHeader, 'AWS ') === 0) {
-            $this->logDebug("Detected AWS Signature V2");
+        } elseif (str_starts_with($authHeader, 'AWS ')) {
             $accessKeyId = $this->authenticateAwsSignatureV2($authHeader);
-        } elseif (strpos($authHeader, 'Bearer ') === 0) {
-            $this->logDebug("Detected Bearer token");
+        } elseif (str_starts_with($authHeader, 'Bearer ')) {
             $this->authenticateBearerToken($authHeader);
-            $this->logDebug("=== Authentication Success (Bearer Token) ===");
             return '';
         } else {
-            $this->logDebug("Unknown authorization type: " . substr($authHeader, 0, 50));
             throw S3Exception::accessDenied();
         }
-        
+
         $this->checkBucketPermission($accessKeyId);
-        
-        $this->logDebug("=== Authentication Success ===");
         return $accessKeyId;
     }
 
     /**
-     * 检查桶权限
+     * Check bucket permission for the access key
      */
     private function checkBucketPermission(string $accessKeyId): void
     {
-        $bucketName = $this->extractBucketName();
-        if ($bucketName) {
-            $this->logDebug("Checking bucket permission for: {$bucketName}");
-            if (!Config::isBucketAllowed($accessKeyId, $bucketName)) {
-                $this->logDebug("Access denied for bucket: {$bucketName}");
-                throw S3Exception::accessDenied("Access denied for bucket: {$bucketName}");
-            }
-            $this->logDebug("Bucket permission granted: {$bucketName}");
+        $bucketName = $this->request->getBucket();
+        if ($bucketName !== '' && !Config::isBucketAllowed($accessKeyId, $bucketName)) {
+            throw S3Exception::accessDenied("Access denied for bucket: {$bucketName}");
         }
     }
 
-    /**
-     * 从请求 URI 中提取桶名
-     */
-    private function extractBucketName(): ?string
-    {
-        $uri = $this->request->getUri();
-        $parts = explode('/', ltrim($uri, '/'));
-        
-        // 对于 S3 风格的 URI，第一个部分是桶名
-        if (count($parts) > 0 && !empty($parts[0])) {
-            return $parts[0];
-        }
-        
-        return null;
-    }
-
-    /**
-     * 检查是否为预签名 URL 请求
-     */
     private function isPresignedUrlRequest(): bool
     {
         return $this->request->hasQueryParam('X-Amz-Credential') ||
                $this->request->hasQueryParam('x-amz-credential');
     }
 
-    /**
-     * AWS Signature Version 4 认证
-     */
+    // ─── AWS Signature Version 4 ──────────────────────────────────────
+
     private function authenticateAwsSignatureV4(string $authHeader): string
     {
         try {
-            // 解析 Authorization header
             $signatureData = $this->parseSignatureV4Header($authHeader);
-            
+
             $accessKeyId = $signatureData['Credential']['AccessKeyId'] ?? null;
             if ($accessKeyId === null) {
                 throw S3Exception::invalidAccessKeyId();
             }
 
-            // 获取密钥
             $secretKey = Config::getSecretKey($accessKeyId);
             if ($secretKey === null) {
-                $this->logDebug("Secret key not found for AccessKeyId: {$accessKeyId}");
                 throw S3Exception::invalidAccessKeyId();
             }
 
-            $this->logDebug("AWS4 Auth: AccessKeyId={$accessKeyId}, Region={$signatureData['Credential']['Region']}, Service={$signatureData['Credential']['Service']}");
-            $this->logDebug("SignedHeaders: {$signatureData['SignedHeaders']}");
-
-            // 验证时间戳（防止重放攻击）
             $this->validateTimestamp($signatureData);
 
-            // 获取当前方法
-            $currentMethod = $this->request->getMethod();
-            $this->logDebug("Current request method: {$currentMethod}");
-
-            // 我们需要尝试的方法列表
-            $methodsToTry = [$currentMethod];
-            
-            // HEAD/GET 请求兼容性处理
-            // Apache 和某些 Web 服务器可能会将 HEAD 请求转换为 GET 请求
-            // 这会导致签名验证失败，因为客户端使用 HEAD 签名，但服务器收到的是 GET
-            // 反之亦然，如果服务器收到 HEAD，但客户端使用 GET 签名，也会失败
-            if ($currentMethod === 'GET' || $currentMethod === 'HEAD') {
-                $alternateMethod = ($currentMethod === 'GET') ? 'HEAD' : 'GET';
-                $methodsToTry[] = $alternateMethod;
-                $this->logDebug("Also trying method: {$alternateMethod} (HEAD/GET compatibility fallback)");
-            }
-
-            $signatureVerified = false;
-            $lastCalculatedSignature = null;
-            $lastStringToSign = null;
-            $verifiedMethod = null;
+            // Try current method first, then alternate for HEAD/GET compatibility
+            $methodsToTry = $this->getMethodsWithFallback();
 
             foreach ($methodsToTry as $method) {
-                $this->logDebug("Trying authentication with method: {$method}");
-                
-                try {
-                    // 构建 StringToSign，使用 overrideMethod 参数
-                    $stringToSign = $this->buildStringToSign($signatureData, $method);
-                    $this->logDebug("StringToSign for method {$method}:\n{$stringToSign}");
-                    
-                    // 计算签名
-                    $calculatedSignature = $this->calculateSignatureV4($stringToSign, $secretKey, $signatureData);
-                    $this->logDebug("Calculated Signature for {$method}: {$calculatedSignature}");
-                    $this->logDebug("Provided Signature: {$signatureData['Signature']}");
-                    
-                    // 保存最后一次计算的结果
-                    $lastCalculatedSignature = $calculatedSignature;
-                    $lastStringToSign = $stringToSign;
-                    
-                    // 验证签名
-                    if (hash_equals($calculatedSignature, $signatureData['Signature'])) {
-                        $this->logDebug("Signature verified successfully with method: {$method}");
-                        $signatureVerified = true;
-                        $verifiedMethod = $method;
-                        break;
-                    }
-                } catch (\Exception $e) {
-                    $this->logDebug("Error trying method {$method}: " . $e->getMessage());
+                $stringToSign = $this->buildStringToSign($signatureData, $method);
+                $calculatedSignature = $this->calculateSignatureV4($stringToSign, $secretKey, $signatureData);
+
+                if (hash_equals($calculatedSignature, $signatureData['Signature'])) {
+                    return $accessKeyId;
                 }
             }
 
-            // 验证签名
-            if (!$signatureVerified) {
-                if ($lastStringToSign !== null && $lastCalculatedSignature !== null) {
-                    $this->logSignatureMismatch($signatureData, $lastStringToSign, $lastCalculatedSignature);
-                }
-                throw S3Exception::signatureDoesNotMatch();
-            }
-
-            // 如果使用了 alternate method 验证成功，记录警告
-            if ($verifiedMethod !== null && $verifiedMethod !== $currentMethod) {
-                $this->logDebug("WARNING: Signature verified with {$verifiedMethod} but request method is {$currentMethod}");
-                $this->logDebug("This suggests a HEAD/GET conversion issue by the web server");
-            }
-
-            $this->logDebug("Signature verified successfully");
-            return $accessKeyId;
-
+            throw S3Exception::signatureDoesNotMatch();
         } catch (S3Exception $e) {
             throw $e;
         } catch (\Exception $e) {
-            $this->logDebug("Authentication error: " . $e->getMessage());
+            Logger::error("[Auth] V4 authentication error: " . $e->getMessage());
             throw S3Exception::accessDenied();
         }
     }
 
-    /**
-     * 解析 SigV4 Authorization Header
-     */
     private function parseSignatureV4Header(string $authHeader): array
     {
-        // 记录原始 header
-        $this->logDebug("Original Authorization header: " . $authHeader);
-        
-        // 清理 header 中的换行符和多余空格
-        // Cloudflare 等代理可能会在 header 中插入换行符（line folding）
-        $cleanedHeader = str_replace(["\r\n", "\r", "\n"], ' ', $authHeader);
-        $cleanedHeader = preg_replace('/\s+/', ' ', $cleanedHeader);
+        // Clean line folding from proxy headers
+        $cleanedHeader = preg_replace('/\s+/', ' ', str_replace(["\r\n", "\r", "\n"], ' ', $authHeader));
         $cleanedHeader = trim($cleanedHeader);
-        
-        if ($cleanedHeader !== $authHeader) {
-            $this->logDebug("Cleaned Authorization header: " . $cleanedHeader);
-        }
-        
-        // AWS4-HMAC-SHA256 Credential=.../.../.../.../..., SignedHeaders=..., Signature=...
+
         $pattern = '/AWS4-HMAC-SHA256\s+Credential=([^,]+),\s*SignedHeaders=([^,]+),\s*Signature=([a-f0-9]+)/i';
-        
+
         if (!preg_match($pattern, $cleanedHeader, $matches)) {
-            $this->logDebug("Failed to parse Authorization header. Pattern mismatch.");
             throw S3Exception::accessDenied('Invalid Authorization header format');
         }
 
-        $credential = $matches[1];
-        $signedHeaders = $matches[2];
-        $signature = $matches[3];
-
-        // 解析 Credential: AccessKeyId/Date/Region/Service/aws4_request
-        $credentialParts = explode('/', $credential);
+        $credentialParts = explode('/', $matches[1]);
         if (count($credentialParts) < 5) {
-            $this->logDebug("Invalid credential format. Parts: " . count($credentialParts));
             throw S3Exception::invalidAccessKeyId();
         }
 
-        $result = [
+        return [
             'Credential' => [
                 'AccessKeyId' => $credentialParts[0],
                 'Date' => $credentialParts[1],
@@ -273,46 +148,46 @@ class Authenticator
                 'Service' => $credentialParts[3],
                 'RequestType' => $credentialParts[4],
             ],
-            'SignedHeaders' => $signedHeaders,
-            'Signature' => $signature,
+            'SignedHeaders' => $matches[2],
+            'Signature' => $matches[3],
         ];
-
-        $this->logDebug("Parsed Credential - AccessKeyId: {$result['Credential']['AccessKeyId']}, Date: {$result['Credential']['Date']}, Region: {$result['Credential']['Region']}, Service: {$result['Credential']['Service']}");
-
-        return $result;
     }
 
-    /**
-     * 验证时间戳（防止重放攻击）
-     */
     private function validateTimestamp(array $signatureData): void
     {
         $amzDate = $this->getAmzDate($this->request->getHeaders());
         if (empty($amzDate)) {
-            $this->logDebug("X-Amz-Date header not found");
             throw S3Exception::invalidRequest('X-Amz-Date header is required');
         }
 
         $requestTime = \DateTime::createFromFormat('Ymd\THis\Z', $amzDate, new \DateTimeZone('UTC'));
         if ($requestTime === false) {
-            $this->logDebug("Invalid X-Amz-Date format: {$amzDate}");
             throw S3Exception::invalidRequest('Invalid X-Amz-Date format');
         }
 
         $now = new \DateTime('now', new \DateTimeZone('UTC'));
         $diff = abs($now->getTimestamp() - $requestTime->getTimestamp());
 
-        $this->logDebug("Request time: {$amzDate}, Server time: {$now->format('Ymd\THis\Z')}, Diff: {$diff}s");
-
         if ($diff > self::MAX_TIMESTAMP_SKEW) {
-            $this->logDebug("Request timestamp skew too large: {$diff}s (max: " . self::MAX_TIMESTAMP_SKEW . "s)");
             throw S3Exception::expiredToken('Request timestamp skew too large');
         }
     }
 
     /**
-     * 构建 StringToSign
+     * Get methods to try, with HEAD/GET fallback for web server compatibility
      */
+    private function getMethodsWithFallback(): array
+    {
+        $currentMethod = $this->request->getMethod();
+        $methods = [$currentMethod];
+
+        if ($currentMethod === 'GET' || $currentMethod === 'HEAD') {
+            $methods[] = ($currentMethod === 'GET') ? 'HEAD' : 'GET';
+        }
+
+        return $methods;
+    }
+
     private function buildStringToSign(array $signatureData, ?string $overrideMethod = null): string
     {
         $method = $overrideMethod ?? $this->request->getMethod();
@@ -321,108 +196,67 @@ class Authenticator
         $headers = $this->request->getHeaders();
         $body = $this->request->getBody();
 
-        $this->logDebug("=== buildStringToSign ===");
-        $this->logDebug("Request method: {$method}" . ($overrideMethod ? " (overridden)" : ""));
-        $this->logDebug("Request URI: {$uri}");
-        
-        // 额外的调试信息 - 检查是否有可能这是一个被转换为 GET 的 HEAD 请求
-        if ($method === 'GET') {
-            // 检查是否有任何线索表明这可能是一个 HEAD 请求
-            // 例如，检查是否存在没有请求体但有 Content-Length 为 0 等情况
-            $contentLength = $this->findHeader($headers, 'content-length');
-            $this->logDebug("GET request check - Content-Length: " . ($contentLength ?? 'not set'));
-            $this->logDebug("GET request check - Body length: " . strlen($body));
-        }
-
-        // 构建规范请求的各个部分
         $canonicalUri = $this->encodeUri($uri);
         $canonicalQueryString = $this->normalizeQueryString($queryString);
         $canonicalHeaders = $this->buildCanonicalHeaders($headers, $signatureData['SignedHeaders']);
         $signedHeaders = strtolower($signatureData['SignedHeaders']);
         $hashedPayload = $this->getPayloadHash($headers, $body, $method);
 
-        $this->logDebug("Canonical URI: {$canonicalUri}");
-        $this->logDebug("Canonical Query String: {$canonicalQueryString}");
-        $this->logDebug("Canonical Headers:\n{$canonicalHeaders}");
-        $this->logDebug("Signed Headers: {$signedHeaders}");
-        $this->logDebug("Hashed Payload: {$hashedPayload}");
-
-        // 构建规范请求
         $canonicalRequest = implode("\n", [
             $method,
             $canonicalUri,
             $canonicalQueryString,
             $canonicalHeaders,
-            '',  // 空行
+            '',
             $signedHeaders,
             $hashedPayload,
         ]);
 
-        $this->logDebug("Canonical Request:\n{$canonicalRequest}");
-
-        // 获取时间戳
         $amzDate = $this->getAmzDate($headers);
         $date = substr($amzDate, 0, 8);
         $region = $signatureData['Credential']['Region'];
         $service = $signatureData['Credential']['Service'];
         $scope = "{$date}/{$region}/{$service}/aws4_request";
 
-        // 构建 StringToSign
-        $stringToSign = implode("\n", [
+        return implode("\n", [
             'AWS4-HMAC-SHA256',
             $amzDate,
             $scope,
             hash('sha256', $canonicalRequest),
         ]);
-
-        $this->logDebug("=== End buildStringToSign ===");
-
-        return $stringToSign;
     }
 
-    /**
-     * URI 编码（遵循 AWS 规范）
-     */
     private function encodeUri(string $uri): string
     {
         $uri = $uri ?: '/';
-        
-        // 分割路径并编码每个部分
+
         $parts = explode('/', $uri);
         $encodedParts = [];
-        
+
         foreach ($parts as $part) {
             if ($part === '') {
                 $encodedParts[] = '';
             } else {
-                // 先解码再编码，确保一致性
-                $decoded = rawurldecode($part);
-                $encodedParts[] = rawurlencode($decoded);
+                $encodedParts[] = rawurlencode(rawurldecode($part));
             }
         }
-        
+
         $result = implode('/', $encodedParts);
-        
-        // 确保路径以 / 开头
+
         if (!str_starts_with($result, '/')) {
             $result = '/' . $result;
         }
-        
+
         return $result;
     }
 
-    /**
-     * 获取 X-Amz-Date 头部值
-     */
     private function getAmzDate(array $headers): string
     {
-        // 优先使用 x-amz-date
         $amzDate = $this->findHeader($headers, 'x-amz-date');
         if ($amzDate !== null) {
             return $amzDate;
         }
 
-        // 回退到 Date 头部
         $dateHeader = $this->findHeader($headers, 'date');
         if ($dateHeader !== null) {
             $timestamp = strtotime($dateHeader);
@@ -431,42 +265,26 @@ class Authenticator
             }
         }
 
-        // 最后使用当前时间
         return gmdate('Ymd\THis\Z');
     }
 
-    /**
-     * 获取请求体哈希
-     */
     private function getPayloadHash(array $headers, string $body, ?string $overrideMethod = null): string
     {
-        // 优先使用 x-amz-content-sha256 头部
         $contentSha256 = $this->findHeader($headers, 'x-amz-content-sha256');
         if ($contentSha256 !== null) {
-            $this->logDebug("Using x-amz-content-sha256: {$contentSha256}");
             return $contentSha256;
         }
 
         $method = $overrideMethod ?? $this->request->getMethod();
-        
-        // 对于没有请求体的请求（HEAD、GET、DELETE），
-        // 确保始终使用空字符串的 SHA256，避免偶发性不一致
-        $emptyPayloadMethods = ['HEAD', 'GET', 'DELETE'];
-        if (in_array($method, $emptyPayloadMethods)) {
-            $this->logDebug("Method {$method} has no body, using empty payload hash");
-            // 空字符串的 SHA256 哈希
+
+        // HEAD, GET, DELETE have no body — use empty string SHA256
+        if (in_array($method, ['HEAD', 'GET', 'DELETE'])) {
             return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
         }
 
-        // 对于其他请求，计算请求体的 SHA256
-        $hash = hash('sha256', $body);
-        $this->logDebug("Calculated payload hash for {$method} request: {$hash}");
-        return $hash;
+        return hash('sha256', $body);
     }
 
-    /**
-     * 规范化查询字符串
-     */
     private function normalizeQueryString(string $queryString): string
     {
         if (empty($queryString)) {
@@ -475,22 +293,18 @@ class Authenticator
 
         $params = [];
         $pairs = explode('&', $queryString);
-        
+
         foreach ($pairs as $pair) {
-            if (strpos($pair, '=') !== false) {
-                list($key, $value) = explode('=', $pair, 2);
-                $decodedKey = rawurldecode($key);
-                $decodedValue = rawurldecode($value);
-                $params[$decodedKey] = $decodedValue;
+            if (str_contains($pair, '=')) {
+                [$key, $value] = explode('=', $pair, 2);
+                $params[rawurldecode($key)] = rawurldecode($value);
             } else {
                 $params[rawurldecode($pair)] = '';
             }
         }
 
-        // 按键排序
         ksort($params, SORT_STRING);
 
-        // 重新编码
         $normalized = [];
         foreach ($params as $key => $value) {
             $normalized[] = rawurlencode($key) . '=' . rawurlencode($value);
@@ -499,9 +313,6 @@ class Authenticator
         return implode('&', $normalized);
     }
 
-    /**
-     * 构建规范头部
-     */
     private function buildCanonicalHeaders(array $headers, string $signedHeaders): string
     {
         $signedHeadersList = explode(';', strtolower($signedHeaders));
@@ -512,53 +323,26 @@ class Authenticator
             if (empty($headerName)) {
                 continue;
             }
-            
+
             $value = $this->findHeader($headers, $headerName);
             if ($value !== null) {
-                $normalizedValue = $this->normalizeHeaderValue($value);
+                $normalizedValue = trim(preg_replace('/\s+/', ' ', $value));
                 $canonicalHeaders[] = strtolower($headerName) . ':' . $normalizedValue;
-                
-                $this->logDebug("CanonicalHeader: {$headerName} = {$normalizedValue}");
-            } else {
-                $this->logDebug("Warning: Signed header '{$headerName}' not found in request");
             }
         }
 
-        // 按字母顺序排序
         sort($canonicalHeaders, SORT_STRING);
 
         return implode("\n", $canonicalHeaders);
     }
 
-    /**
-     * 规范化头部值
-     */
-    private function normalizeHeaderValue(string $value): string
-    {
-        // 去除首尾空格
-        $value = trim($value);
-        // 将连续多个空格替换为单个空格
-        $value = preg_replace('/\s+/', ' ', $value);
-        return $value;
-    }
-
-    /**
-     * 查找头部（不区分大小写）
-     */
     private function findHeader(array $headers, string $name): ?string
     {
-        $name = strtolower($name);
-        foreach ($headers as $key => $value) {
-            if (strtolower($key) === $name) {
-                return $value;
-            }
-        }
-        return null;
+        // Delegate to Request's O(1) lowercased-header map. The $headers param
+        // is kept for signature compatibility but unused.
+        return $this->request->getHeader($name);
     }
 
-    /**
-     * 计算 SigV4 签名
-     */
     private function calculateSignatureV4(string $stringToSign, string $secretKey, array $signatureData): string
     {
         $amzDate = $this->getAmzDate($this->request->getHeaders());
@@ -569,122 +353,53 @@ class Authenticator
         return $this->calculateSignatureV4WithDate($stringToSign, $secretKey, $date, $region, $service);
     }
 
-    /**
-     * 使用指定日期计算 SigV4 签名
-     */
     private function calculateSignatureV4WithDate(string $stringToSign, string $secretKey, string $date, string $region, string $service): string
     {
-        // 派生签名密钥
         $kDate = hash_hmac('sha256', $date, 'AWS4' . $secretKey, true);
         $kRegion = hash_hmac('sha256', $region, $kDate, true);
         $kService = hash_hmac('sha256', $service, $kRegion, true);
         $kSigning = hash_hmac('sha256', 'aws4_request', $kService, true);
 
-        // 计算最终签名
         return hash_hmac('sha256', $stringToSign, $kSigning);
     }
 
-    /**
-     * 预签名 URL 认证
-     */
+    // ─── Presigned URL ──────────────────────────────────────────────────
+
     private function authenticatePresignedUrl(): string
     {
         try {
             $presignedData = $this->parsePresignedUrlParams();
-            
-            $accessKeyId = $presignedData['Credential']['AccessKeyId'];
-            $this->logDebug("Presigned URL Auth: AccessKeyId={$accessKeyId}");
-            $this->logDebug("Expires: " . ($presignedData['Expires'] ?? 'not set'));
 
-            // 检查签名是否过期
+            $accessKeyId = $presignedData['Credential']['AccessKeyId'];
             $this->checkPresignedUrlExpiry($presignedData);
 
             $secretKey = Config::getSecretKey($accessKeyId);
             if ($secretKey === null) {
-                $this->logDebug("Secret key not found for presigned URL: {$accessKeyId}");
                 throw S3Exception::invalidAccessKeyId();
             }
 
-            // 获取当前方法
-            $currentMethod = $this->request->getMethod();
-            $this->logDebug("Current request method: {$currentMethod}");
-
-            // HEAD/GET 请求兼容性处理
-            $methodsToTry = [$currentMethod];
-            if ($currentMethod === 'GET' || $currentMethod === 'HEAD') {
-                $alternateMethod = ($currentMethod === 'GET') ? 'HEAD' : 'GET';
-                $methodsToTry[] = $alternateMethod;
-                $this->logDebug("Also trying method: {$alternateMethod} (HEAD/GET compatibility fallback)");
-            }
-
-            $signatureVerified = false;
-            $lastCalculatedSignature = null;
-            $lastStringToSign = null;
-            $verifiedMethod = null;
+            $methodsToTry = $this->getMethodsWithFallback();
 
             foreach ($methodsToTry as $method) {
-                $this->logDebug("Trying presigned URL authentication with method: {$method}");
-                
-                try {
-                    // 构建 StringToSign，使用 overrideMethod 参数
-                    $stringToSign = $this->buildPresignedUrlStringToSign($presignedData, $method);
-                    $this->logDebug("Presigned URL StringToSign for method {$method}:\n{$stringToSign}");
+                $stringToSign = $this->buildPresignedUrlStringToSign($presignedData, $method);
+                $calculatedSignature = $this->calculatePresignedUrlSignature($stringToSign, $secretKey, $presignedData);
 
-                    // 计算签名
-                    $calculatedSignature = $this->calculatePresignedUrlSignature($stringToSign, $secretKey, $presignedData);
-                    $this->logDebug("Calculated Signature for {$method}: {$calculatedSignature}");
-                    $this->logDebug("Provided Signature: {$presignedData['Signature']}");
-                    
-                    // 保存最后一次计算的结果
-                    $lastCalculatedSignature = $calculatedSignature;
-                    $lastStringToSign = $stringToSign;
-                    
-                    // 验证签名
-                    if (hash_equals($calculatedSignature, $presignedData['Signature'])) {
-                        $this->logDebug("Presigned URL signature verified successfully with method: {$method}");
-                        $signatureVerified = true;
-                        $verifiedMethod = $method;
-                        break;
-                    }
-                } catch (\Exception $e) {
-                    $this->logDebug("Error trying presigned URL method {$method}: " . $e->getMessage());
+                if (hash_equals($calculatedSignature, $presignedData['Signature'])) {
+                    return $accessKeyId;
                 }
             }
 
-            // 验证签名
-            if (!$signatureVerified) {
-                if ($lastStringToSign !== null && $lastCalculatedSignature !== null) {
-                    $this->logDebug("Presigned URL signature mismatch");
-                    $this->logDebug("Expected: {$lastCalculatedSignature}");
-                    $this->logDebug("Got: {$presignedData['Signature']}");
-                    $this->logDebug("StringToSign:\n{$lastStringToSign}");
-                }
-                throw S3Exception::signatureDoesNotMatch();
-            }
-
-            // 如果使用了 alternate method 验证成功，记录警告
-            if ($verifiedMethod !== null && $verifiedMethod !== $currentMethod) {
-                $this->logDebug("WARNING: Presigned URL signature verified with {$verifiedMethod} but request method is {$currentMethod}");
-                $this->logDebug("This suggests a HEAD/GET conversion issue by web server");
-            }
-
-            $this->logDebug("Presigned URL signature verified successfully");
-            return $accessKeyId;
-
+            throw S3Exception::signatureDoesNotMatch();
         } catch (S3Exception $e) {
             throw $e;
         } catch (\Exception $e) {
-            $this->logDebug("Presigned URL authentication error: " . $e->getMessage());
+            Logger::error("[Auth] Presigned URL authentication error: " . $e->getMessage());
             throw S3Exception::accessDenied();
         }
     }
 
-    /**
-     * 解析预签名 URL 参数
-     */
     private function parsePresignedUrlParams(): array
     {
-        // 获取参数（不区分大小写）
         $credential = $this->request->getQueryParam('X-Amz-Credential') ??
                       $this->request->getQueryParam('x-amz-credential');
         $algorithm = $this->request->getQueryParam('X-Amz-Algorithm') ??
@@ -699,12 +414,10 @@ class Authenticator
                      $this->request->getQueryParam('x-amz-signature');
 
         if (empty($credential) || empty($algorithm) || empty($date) ||
-            empty($signedHeaders) || empty($signature)) {
-            $this->logDebug("Missing required presigned URL parameters");
+            empty($signedHeaders) || empty($signature) || empty($expires)) {
             throw S3Exception::accessDenied('Missing required presigned URL parameters');
         }
 
-        // 解析 Credential
         $credentialParts = explode('/', $credential);
         if (count($credentialParts) < 5) {
             throw S3Exception::invalidAccessKeyId();
@@ -720,25 +433,22 @@ class Authenticator
                 'RequestType' => $credentialParts[4],
             ],
             'AmzDate' => $date,
-            'Expires' => $expires ? (int)$expires : null,
+            'Expires' => (int)$expires,
             'SignedHeaders' => $signedHeaders,
             'Signature' => $signature,
         ];
     }
 
-    /**
-     * 检查预签名 URL 是否过期
-     */
     private function checkPresignedUrlExpiry(array $presignedData): void
     {
         $expires = $presignedData['Expires'];
-        if ($expires === null) {
-            return; // 未指定过期时间
+
+        // S3 spec: X-Amz-Expires must be 1..604800 (7 days).
+        if ($expires < 1 || $expires > 604800) {
+            throw S3Exception::invalidRequest('X-Amz-Expires must be between 1 and 604800 seconds');
         }
 
-        $amzDate = $presignedData['AmzDate'];
-        $requestTime = \DateTime::createFromFormat('Ymd\THis\Z', $amzDate, new \DateTimeZone('UTC'));
-
+        $requestTime = \DateTime::createFromFormat('Ymd\THis\Z', $presignedData['AmzDate'], new \DateTimeZone('UTC'));
         if ($requestTime === false) {
             throw S3Exception::invalidRequest('Invalid X-Amz-Date format');
         }
@@ -746,17 +456,11 @@ class Authenticator
         $expiryTime = clone $requestTime;
         $expiryTime->modify("+{$expires} seconds");
 
-        $now = new \DateTime('now', new \DateTimeZone('UTC'));
-
-        if ($now > $expiryTime) {
-            $this->logDebug("Presigned URL expired. Expiry: {$expiryTime->format('Y-m-d H:i:s')}, Now: {$now->format('Y-m-d H:i:s')}");
+        if (new \DateTime('now', new \DateTimeZone('UTC')) > $expiryTime) {
             throw S3Exception::expiredToken('Request has expired');
         }
     }
 
-    /**
-     * 构建预签名 URL 的 StringToSign
-     */
     private function buildPresignedUrlStringToSign(array $presignedData, ?string $overrideMethod = null): string
     {
         $method = $overrideMethod ?? $this->request->getMethod();
@@ -769,9 +473,6 @@ class Authenticator
         $canonicalHeaders = $this->buildCanonicalHeaders($headers, $presignedData['SignedHeaders']);
         $signedHeaders = strtolower($presignedData['SignedHeaders']);
 
-        // 预签名 URL 使用 UNSIGNED-PAYLOAD
-        $hashedPayload = 'UNSIGNED-PAYLOAD';
-
         $canonicalRequest = implode("\n", [
             $method,
             $canonicalUri,
@@ -779,7 +480,7 @@ class Authenticator
             $canonicalHeaders,
             '',
             $signedHeaders,
-            $hashedPayload,
+            'UNSIGNED-PAYLOAD',
         ]);
 
         $amzDate = $presignedData['AmzDate'];
@@ -788,23 +489,14 @@ class Authenticator
         $service = $presignedData['Credential']['Service'];
         $scope = "{$date}/{$region}/{$service}/aws4_request";
 
-        $stringToSign = implode("\n", [
+        return implode("\n", [
             'AWS4-HMAC-SHA256',
             $amzDate,
             $scope,
             hash('sha256', $canonicalRequest),
         ]);
-
-        if (Config::appDebug()) {
-            $this->logDebug("Presigned URL CanonicalRequest:\n{$canonicalRequest}");
-        }
-
-        return $stringToSign;
     }
 
-    /**
-     * 构建预签名 URL 的规范查询字符串
-     */
     private function buildPresignedCanonicalQueryString(string $queryString): string
     {
         if (empty($queryString)) {
@@ -815,11 +507,10 @@ class Authenticator
         $pairs = explode('&', $queryString);
 
         foreach ($pairs as $pair) {
-            if (strpos($pair, '=') !== false) {
-                list($key, $value) = explode('=', $pair, 2);
+            if (str_contains($pair, '=')) {
+                [$key, $value] = explode('=', $pair, 2);
                 $decodedKey = rawurldecode($key);
 
-                // 排除 X-Amz-Signature
                 if (strcasecmp($decodedKey, 'X-Amz-Signature') === 0) {
                     continue;
                 }
@@ -834,10 +525,8 @@ class Authenticator
             }
         }
 
-        // 按键排序
         ksort($params, SORT_STRING);
 
-        // 重新编码
         $normalized = [];
         foreach ($params as $key => $value) {
             $normalized[] = rawurlencode($key) . '=' . rawurlencode($value);
@@ -846,21 +535,19 @@ class Authenticator
         return implode('&', $normalized);
     }
 
-    /**
-     * 计算预签名 URL 签名
-     */
     private function calculatePresignedUrlSignature(string $stringToSign, string $secretKey, array $presignedData): string
     {
-        $date = $presignedData['Credential']['Date'];
-        $region = $presignedData['Credential']['Region'];
-        $service = $presignedData['Credential']['Service'];
-
-        return $this->calculateSignatureV4WithDate($stringToSign, $secretKey, $date, $region, $service);
+        return $this->calculateSignatureV4WithDate(
+            $stringToSign,
+            $secretKey,
+            $presignedData['Credential']['Date'],
+            $presignedData['Credential']['Region'],
+            $presignedData['Credential']['Service']
+        );
     }
 
-    /**
-     * AWS Signature Version 2 认证（遗留支持）
-     */
+    // ─── AWS Signature Version 2 (legacy) ──────────────────────────────
+
     private function authenticateAwsSignatureV2(string $authHeader): string
     {
         $pattern = '/AWS\s+([^:]+):(.+)/';
@@ -876,8 +563,8 @@ class Authenticator
             throw S3Exception::invalidAccessKeyId();
         }
 
-        $stringToSign = $this->request->getMethod() . "\n\n\n" . 
-                        $this->request->getHeader('Date') . "\n" . 
+        $stringToSign = $this->request->getMethod() . "\n\n\n" .
+                        $this->request->getHeader('Date') . "\n" .
                         $this->request->getUri();
 
         $expectedSignature = base64_encode(hash_hmac('sha1', $stringToSign, $secretKey, true));
@@ -889,9 +576,8 @@ class Authenticator
         return $accessKeyId;
     }
 
-    /**
-     * Bearer Token 认证
-     */
+    // ─── Bearer Token ──────────────────────────────────────────────────
+
     private function authenticateBearerToken(string $authHeader): void
     {
         $token = substr($authHeader, 7);
@@ -902,48 +588,40 @@ class Authenticator
         }
     }
 
-    /**
-     * 检查请求大小
-     */
+    // ─── Request size check ────────────────────────────────────────────
+
     public function checkRequestSize(string $accessKeyId): void
     {
-        $contentLength = $this->request->getHeader('Content-Length');
         $maxSize = Config::getFileMaxSize($accessKeyId);
-
-        if ($maxSize > 0 && $contentLength !== null && (int)$contentLength > $maxSize) {
-            throw S3Exception::entityTooLarge((int)$contentLength, $maxSize);
-        }
-    }
-
-    /**
-     * 记录签名不匹配调试信息
-     */
-    private function logSignatureMismatch(array $signatureData, string $stringToSign, string $calculatedSignature): void
-    {
-        if (!Config::appDebug()) {
+        if ($maxSize <= 0) {
             return;
         }
 
-        $this->logDebug("=== Signature Mismatch Details ===");
-        $this->logDebug("Expected: {$calculatedSignature}");
-        $this->logDebug("Got: {$signatureData['Signature']}");
-        $this->logDebug("StringToSign:\n{$stringToSign}");
-        
-        // 记录请求头部信息以便调试
-        $headers = $this->request->getHeaders();
-        $this->logDebug("Request Headers:");
-        foreach ($headers as $name => $value) {
-            $this->logDebug("  {$name}: {$value}");
+        // Prefer Content-Length header; fall back to decoded body length so that
+        // aws-chunked / chunked transfers (which may omit a meaningful Content-Length)
+        // cannot bypass the per-key upload size limit.
+        $contentLength = $this->request->getHeader('Content-Length');
+        $actualSize = $contentLength !== null ? (int)$contentLength : strlen($this->request->getBody());
+
+        if ($actualSize > $maxSize) {
+            throw S3Exception::entityTooLarge($actualSize, $maxSize);
         }
     }
 
     /**
-     * 调试日志记录
+     * 早期请求大小检查：基于 Content-Length 头，在认证前拒绝超大请求。
+     * 全局上限 = 所有 access key 中最大的 file_max_size。
+     * 若所有 key 均无限制（返回 0），跳过，回退到认证后的 per-key checkRequestSize()。
      */
-    private function logDebug(string $message): void
+    public function checkEarlyRequestSize(): void
     {
-        if (Config::appDebug()) {
-            Logger::debug("[Authenticator] {$message}");
+        $contentLength = $this->request->getHeader('Content-Length');
+        if ($contentLength === null) {
+            return;
+        }
+        $globalMax = Config::getMaxUploadSize();
+        if ($globalMax > 0 && (int)$contentLength > $globalMax) {
+            throw S3Exception::entityTooLarge((int)$contentLength, $globalMax);
         }
     }
 }

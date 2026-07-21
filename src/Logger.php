@@ -18,7 +18,7 @@ class Logger
             return;
         }
 
-        $timestamp = date('Y-m-d H:i:s');
+        $timestamp = gmdate('Y-m-d H:i:s\Z');
         $logLine = sprintf("[%s] [%s] %s\n", $timestamp, $level, $message);
         @error_log($logLine, 3, self::$logFile);
     }
@@ -86,7 +86,7 @@ class Logger
     private static function sanitizePath(string $path): string
     {
         $basePath = dirname(__DIR__);
-        if (strpos($path, $basePath) === 0) {
+        if (str_starts_with($path, $basePath)) {
             return '[PROJECT]' . substr($path, strlen($basePath));
         }
         return $path;

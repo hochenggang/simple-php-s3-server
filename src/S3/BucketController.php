@@ -32,9 +32,7 @@ class BucketController
     {
         $bucket = $request->getBucket();
 
-        if (empty($bucket)) {
-            throw S3Exception::invalidBucketName();
-        }
+        $this->validateBucket($bucket);
 
         if ($this->storage->bucketExists($bucket)) {
             throw S3Exception::bucketAlreadyExists($bucket);
@@ -51,9 +49,7 @@ class BucketController
     {
         $bucket = $request->getBucket();
 
-        if (empty($bucket)) {
-            throw S3Exception::invalidBucketName();
-        }
+        $this->validateBucket($bucket);
 
         if (!$this->storage->bucketExists($bucket)) {
             throw S3Exception::noSuchBucket('/' . $bucket);
@@ -73,21 +69,34 @@ class BucketController
     public function listObjects(Request $request, Response $response): void
     {
         $bucket = $request->getBucket();
-        $prefix = $request->getQueryParam('prefix') ?? '';
-        $maxKeys = (int)($request->getQueryParam('max-keys') ?? 1000);
-        $delimiter = $request->getQueryParam('delimiter') ?? '';
-
-        if (empty($bucket)) {
-            throw S3Exception::invalidBucketName();
-        }
+        $this->validateBucket($bucket);
 
         if (!$this->storage->bucketExists($bucket)) {
             throw S3Exception::noSuchBucket('/' . $bucket);
         }
 
-        $result = $this->storage->listObjects($bucket, $prefix, $maxKeys);
+        $prefix = $request->getQueryParam('prefix') ?? '';
+        $maxKeys = max(0, min(1000, (int)($request->getQueryParam('max-keys') ?? 1000)));
+        $marker = $request->getQueryParam('marker') ?? '';
+        $delimiter = $request->getQueryParam('delimiter') ?? '';
+        $encodingType = $request->getQueryParam('encoding-type') ?? '';
 
-        $xml = XmlResponse::listObjects($result['objects'], $bucket, $prefix);
+        $result = $this->storage->listObjects(
+            $bucket, $prefix, $maxKeys, 0, $delimiter, '', $marker
+        );
+
+        $xml = XmlResponse::listObjects(
+            $result['objects'],
+            $bucket,
+            $prefix,
+            $maxKeys,
+            $marker,
+            $delimiter,
+            $result['commonPrefixes'],
+            $result['isTruncated'],
+            $encodingType,
+            $result['nextMarker']
+        );
 
         $response
             ->setHeader('Content-Type', 'application/xml')
@@ -98,30 +107,40 @@ class BucketController
     public function listObjectsV2(Request $request, Response $response): void
     {
         $bucket = $request->getBucket();
-        $prefix = $request->getQueryParam('prefix') ?? '';
-        $maxKeys = (int)($request->getQueryParam('max-keys') ?? 1000);
-        $continuationToken = $request->getQueryParam('continuation-token') ?? '';
-        $startAfter = $request->getQueryParam('start-after') ?? '';
-        $fetchOwner = strtolower($request->getQueryParam('fetch-owner') ?? '') === 'true';
-
-        if (empty($bucket)) {
-            throw S3Exception::invalidBucketName();
-        }
+        $this->validateBucket($bucket);
 
         if (!$this->storage->bucketExists($bucket)) {
             throw S3Exception::noSuchBucket('/' . $bucket);
         }
 
-        $skip = 0;
-        if ($continuationToken) {
-            $skip = (int)base64_decode($continuationToken);
+        $prefix = $request->getQueryParam('prefix') ?? '';
+        $maxKeys = max(0, min(1000, (int)($request->getQueryParam('max-keys') ?? 1000)));
+        $continuationToken = $request->getQueryParam('continuation-token') ?? '';
+        $startAfter = $request->getQueryParam('start-after') ?? '';
+        $fetchOwner = strtolower($request->getQueryParam('fetch-owner') ?? '') === 'true';
+        $delimiter = $request->getQueryParam('delimiter') ?? '';
+        $encodingType = $request->getQueryParam('encoding-type') ?? '';
+
+        // token = urlSafeBase64(lastItem)，解码后作为 startAfter。
+        // startAfter 仅在无 continuationToken 时生效（AWS 规范）。
+        $effectiveStartAfter = '';
+        if ($continuationToken !== '') {
+            $decoded = self::decodeContinuationToken($continuationToken);
+            if ($decoded === null) {
+                throw S3Exception::invalidRequest('Invalid continuation token');
+            }
+            $effectiveStartAfter = $decoded;
+        } elseif ($startAfter !== '') {
+            $effectiveStartAfter = $startAfter;
         }
 
-        $result = $this->storage->listObjects($bucket, $prefix, $maxKeys, $skip);
+        $result = $this->storage->listObjects(
+            $bucket, $prefix, $maxKeys, 0, $delimiter, $effectiveStartAfter
+        );
 
         $nextToken = '';
         if ($result['isTruncated']) {
-            $nextToken = base64_encode((string)($skip + count($result['objects'])));
+            $nextToken = self::encodeContinuationToken($result['nextMarker']);
         }
 
         $xml = XmlResponse::listObjectsV2(
@@ -132,12 +151,37 @@ class BucketController
             $continuationToken,
             $nextToken,
             $startAfter,
-            $fetchOwner
+            $fetchOwner,
+            $delimiter,
+            $result['commonPrefixes'],
+            $encodingType
         );
 
         $response
             ->setHeader('Content-Type', 'application/xml')
             ->setBody($xml)
             ->send();
+    }
+
+    /**
+     * URL-safe base64 编码：避免 + / 被 parse_str 解码为空格/路径分隔符。
+     * = 填充保留（parse_str 对值中的 = 透明）。
+     */
+    private static function encodeContinuationToken(string $lastKey): string
+    {
+        return strtr(base64_encode($lastKey), '+/', '-_');
+    }
+
+    private static function decodeContinuationToken(string $token): ?string
+    {
+        $decoded = base64_decode(strtr($token, '-_', '+/'), true);
+        return $decoded === false ? null : $decoded;
+    }
+
+    private function validateBucket(string $bucket): void
+    {
+        if (empty($bucket)) {
+            throw S3Exception::invalidBucketName();
+        }
     }
 }

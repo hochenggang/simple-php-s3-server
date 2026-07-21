@@ -19,7 +19,7 @@ Implement a pure local filesystem-based S3-compatible API gateway using PHP.
 - Head
 - Delete
 - DeleteMultiple
-- List
+- List & List V2
 
 ### Multipart Upload
 

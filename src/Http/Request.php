@@ -11,7 +11,10 @@ class Request
     private string $uri;
     private string $queryString;
     private array $headers = [];
-    private string $body = '';
+    /** @var array<string,string> lowercased header name => value, for O(1) lookup */
+    private array $lowerHeaders = [];
+    /** @var string|null null = body not yet read; lazy to avoid loading php://input on size-check-then-reject paths */
+    private ?string $body = null;
     private string $bucket = '';
     private string $key = '';
     private array $queryParams = [];
@@ -19,172 +22,38 @@ class Request
     public function __construct()
     {
         $originalMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
-        $this->method = $originalMethod;
-        
-        // HEAD 请求检测和恢复机制
-        // Apache 和某些 Web 服务器可能会将 HEAD 请求转换为 GET 请求
-        // 我们需要检测这种情况并恢复原始的 HEAD 方法
-        $this->detectAndRestoreHeadRequest($originalMethod);
-        
+        $this->method = $this->detectMethod($originalMethod);
         $this->uri = $this->parseUri();
         $this->queryString = $_SERVER['QUERY_STRING'] ?? '';
-        
-        // 在解析头部之前记录原始请求信息
-        $this->logRequestArrival();
-        
         $this->headers = $this->parseHeaders();
-        $this->body = $this->readBody();
+        // body is read lazily on first getBody() call so that early size checks
+        // can reject oversized requests without first loading them into memory.
         $this->parsePath();
         $this->parseQueryParams();
     }
-    
+
     /**
-     * 检测并恢复被转换为 GET 的 HEAD 请求
-     * 
-     * Apache 和某些 Web 服务器可能会将 HEAD 请求转换为 GET 请求
-     * 这会导致签名验证失败，因为客户端使用 HEAD 签名，但服务器收到的是 GET
-     * 
-     * 检测策略：
-     * 1. 检查 X-HTTP-Method-Override 头部
-     * 2. 检查是否有 HEAD 请求的特征（无请求体、有 Content-Length: 0 等）
-     * 3. 检查 Authorization 头部中是否暗示了 HEAD 方法
+     * Detect the actual HTTP method, handling HEAD->GET conversion by web servers
      */
-    private function detectAndRestoreHeadRequest(string $originalMethod): void
+    private function detectMethod(string $originalMethod): string
     {
-        // 如果原始方法已经是 HEAD，无需处理
         if ($originalMethod === 'HEAD') {
-            $this->method = 'HEAD';
-            Logger::debug("[Request] Original method is HEAD, no conversion needed");
-            return;
+            return 'HEAD';
         }
-        
-        // 如果原始方法不是 GET，不太可能是被转换的 HEAD 请求
+
         if ($originalMethod !== 'GET') {
-            return;
+            return $originalMethod;
         }
-        
-        // 检测策略 1: 检查 X-HTTP-Method-Override 头部
+
+        // Check X-HTTP-Method-Override header
         if (isset($_SERVER['HTTP_X_HTTP_METHOD_OVERRIDE'])) {
-            $overrideMethod = strtoupper($_SERVER['HTTP_X_HTTP_METHOD_OVERRIDE']);
-            if ($overrideMethod === 'HEAD') {
-                $this->method = 'HEAD';
-                Logger::debug("[Request] Detected HEAD via X-HTTP-Method-Override");
-                return;
+            $override = strtoupper($_SERVER['HTTP_X_HTTP_METHOD_OVERRIDE']);
+            if ($override === 'HEAD') {
+                return 'HEAD';
             }
         }
-        
-        // 检测策略 2: 检查其他可能的头部
-        if (function_exists('getallheaders')) {
-            $headers = getallheaders();
-            foreach ($headers as $name => $value) {
-                if (stripos($name, 'x-http-method') !== false && stripos($value, 'HEAD') !== false) {
-                    $this->method = 'HEAD';
-                    Logger::debug("[Request] Detected HEAD via custom header: {$name} = {$value}");
-                    return;
-                }
-            }
-        }
-        
-        // 检测策略 3: 检查 Authorization 头部中的方法签名
-        // 如果客户端使用 HEAD 签名，但服务器收到的是 GET，我们需要恢复 HEAD
-        if (isset($_SERVER['HTTP_AUTHORIZATION'])) {
-            $authHeader = $_SERVER['HTTP_AUTHORIZATION'];
-            // 尝试从 Authorization 头部推断原始方法
-            // 注意：这不是 100% 可靠的，但可以作为一个启发式方法
-            // 更可靠的方法是在签名验证阶段尝试两种方法
-        }
-        
-        // 记录检测结果
-        if ($this->method === 'HEAD') {
-            Logger::debug("[Request] Restored HEAD request (original: {$originalMethod})");
-        } else {
-            Logger::debug("[Request] No evidence of HEAD->GET conversion, keeping method: {$originalMethod}");
-        }
-    }
-    
-    /**
-     * 记录请求到达时的原始信息，用于调试 CDN 后的请求头变化
-     */
-    private function logRequestArrival(): void
-    {
-        if (!Config::appDebug()) {
-            return;
-        }
-        
-        Logger::debug("[RequestArrival] ========== New Request ==========");
-        Logger::debug("[RequestArrival] Method: {$this->method}");
-        $requestUri = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : 'N/A';
-        Logger::debug("[RequestArrival] URI: {$requestUri}");
-        Logger::debug("[RequestArrival] Query String: {$this->queryString}");
-        $clientIp = isset($_SERVER['REMOTE_ADDR']) ? $_SERVER['REMOTE_ADDR'] : 'N/A';
-        Logger::debug("[RequestArrival] Client IP: {$clientIp}");
-        
-        // 记录所有原始 HTTP 头部（从 $_SERVER 中提取）
-        Logger::debug("[RequestArrival] --- Raw HTTP Headers from \$_SERVER ---");
-        $httpHeaders = [];
-        foreach ($_SERVER as $key => $value) {
-            if (strpos($key, 'HTTP_') === 0) {
-                $headerName = str_replace('_', '-', substr($key, 5));
-                $httpHeaders[$headerName] = $value;
-                Logger::debug("[RequestArrival]   {$headerName}: {$value}");
-            }
-        }
-        
-        // 记录特殊头部
-        Logger::debug("[RequestArrival] --- Special Headers ---");
-        $specialHeaders = ['CONTENT_TYPE', 'CONTENT_LENGTH', 'REQUEST_METHOD', 'REQUEST_URI', 'QUERY_STRING', 'SERVER_NAME', 'SERVER_PORT', 'HTTPS'];
-        foreach ($specialHeaders as $header) {
-            if (isset($_SERVER[$header])) {
-                Logger::debug("[RequestArrival]   {$header}: {$_SERVER[$header]}");
-            }
-        }
-        
-        // 记录 CDN 相关头部（如果有）
-        Logger::debug("[RequestArrival] --- CDN/Proxy Headers ---");
-        $cdnHeaders = ['HTTP_CF_CONNECTING_IP', 'HTTP_CF_RAY', 'HTTP_CF_VISITOR', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_FORWARDED_HOST', 'HTTP_X_FORWARDED_PROTO', 'HTTP_X_REAL_IP'];
-        $hasCdnHeaders = false;
-        foreach ($cdnHeaders as $header) {
-            if (isset($_SERVER[$header])) {
-                $hasCdnHeaders = true;
-                $cleanName = str_replace('HTTP_', '', $header);
-                $cleanName = str_replace('_', '-', $cleanName);
-                Logger::debug("[RequestArrival]   {$cleanName}: {$_SERVER[$header]}");
-            }
-        }
-        if (!$hasCdnHeaders) {
-            Logger::debug("[RequestArrival]   (No CDN headers detected)");
-        }
-        
-        // 检查 Authorization 头部并解析 SignedHeaders
-        if (isset($_SERVER['HTTP_AUTHORIZATION'])) {
-            Logger::debug("[RequestArrival] --- Authorization Header Analysis ---");
-            $authHeader = $_SERVER['HTTP_AUTHORIZATION'];
-            Logger::debug("[RequestArrival]   Raw: {$authHeader}");
-            
-            // 解析 SignedHeaders
-            if (preg_match('/SignedHeaders=([^,]+)/i', $authHeader, $matches)) {
-                $signedHeaders = $matches[1];
-                Logger::debug("[RequestArrival]   SignedHeaders: {$signedHeaders}");
-                
-                // 列出每个被签名的头部
-                $headersList = explode(';', $signedHeaders);
-                Logger::debug("[RequestArrival]   Signed Headers List:");
-                foreach ($headersList as $header) {
-                    $header = trim($header);
-                    // 检查这个头部是否在请求中存在
-                    $serverKey = 'HTTP_' . strtoupper(str_replace('-', '_', $header));
-                    $exists = isset($_SERVER[$serverKey]) ? '✓' : '✗';
-                    $value = $_SERVER[$serverKey] ?? 'NOT FOUND';
-                    Logger::debug("[RequestArrival]     [{$exists}] {$header}: {$value}");
-                }
-            } else {
-                Logger::debug("[RequestArrival]   SignedHeaders: NOT FOUND in Authorization header");
-            }
-        } else {
-            Logger::debug("[RequestArrival] --- No Authorization Header ---");
-        }
-        
-        Logger::debug("[RequestArrival] ========== End Request Arrival Log ==========");
+
+        return $originalMethod;
     }
 
     private function parseUri(): string
@@ -200,45 +69,49 @@ class Request
     private function parseHeaders(): array
     {
         $headers = [];
+        $lower = [];
+        $add = function (string $name, ?string $value) use (&$headers, &$lower): void {
+            if ($value === null) {
+                return;
+            }
+            // Clean line folding from proxy headers (e.g. Cloudflare)
+            $value = str_replace(["\r\n", "\r", "\n"], ' ', $value);
+            $value = preg_replace('/\s+/', ' ', $value);
+            $value = trim($value);
+            $upper = strtoupper($name);
+            $headers[$upper] = $value;
+            $lower[strtolower($name)] = $value;
+        };
+
         foreach ($_SERVER as $key => $value) {
-            if (strpos($key, 'HTTP_') === 0) {
+            if (str_starts_with($key, 'HTTP_')) {
                 $headerName = str_replace('_', '-', substr($key, 5));
-                $headerKey = strtoupper($headerName);
-                // 清理 header 值中的换行符和多余空格
-                // Cloudflare 等代理可能会在 header 中插入换行符（line folding）
-                if ($value !== null) {
-                    $value = str_replace(["\r\n", "\r", "\n"], ' ', $value);
-                    $value = preg_replace('/\s+/', ' ', $value);
-                    $value = trim($value);
-                }
-                $headers[$headerKey] = $value;
+                $add($headerName, $value);
             }
         }
 
         if (isset($_SERVER['CONTENT_TYPE'])) {
-            $headers['CONTENT-TYPE'] = $_SERVER['CONTENT_TYPE'];
+            $add('Content-Type', $_SERVER['CONTENT_TYPE']);
         }
         if (isset($_SERVER['CONTENT_LENGTH'])) {
-            $headers['CONTENT-LENGTH'] = $_SERVER['CONTENT_LENGTH'];
+            $add('Content-Length', $_SERVER['CONTENT_LENGTH']);
         }
         if (isset($_SERVER['HTTP_RANGE'])) {
-            $headers['RANGE'] = $_SERVER['HTTP_RANGE'];
+            $add('Range', $_SERVER['HTTP_RANGE']);
         }
 
-        // Cloudflare 支持：使用 X-Forwarded-Host 作为 Host 头部（如果存在）
-        if (isset($headers['X-FORWARDED-HOST'])) {
-            $originalHost = $headers['HOST'] ?? 'not-set';
-            $headers['HOST'] = $headers['X-FORWARDED-HOST'];
-            if (Config::appDebug()) {
-                Logger::debug("[parseHeaders] X-Forwarded-Host detected, overriding HOST: {$originalHost} -> {$headers['HOST']}");
-            }
+        // Trust X-Forwarded-Host only when explicitly enabled behind a reverse proxy.
+        // Default false: prevents Host forgery when directly exposed.
+        if (Config::trustProxyHeaders() && isset($lower['x-forwarded-host'])) {
+            $add('Host', $lower['x-forwarded-host']);
         }
 
-        // 调试模式：输出所有头部到错误日志
+        $this->lowerHeaders = $lower;
+
         if (Config::appDebug()) {
-            Logger::debug("[parseHeaders] All headers:");
+            Logger::debug("[Request] Method: {$this->method}, URI: {$this->uri}");
             foreach ($headers as $name => $value) {
-                Logger::debug("[parseHeaders]   {$name}: {$value}");
+                Logger::debug("[Request] Header: {$name}: {$value}");
             }
         }
 
@@ -248,70 +121,30 @@ class Request
     private function readBody(): string
     {
         if ($this->method === 'HEAD') {
-            Logger::debug("[readBody] HEAD request, returning empty body");
             return '';
         }
-        
-        $contentLength = $_SERVER['CONTENT_LENGTH'] ?? 'not set';
-        $transferEncoding = $_SERVER['HTTP_TRANSFER_ENCODING'] ?? 'not set';
-        $contentEncoding = $_SERVER['HTTP_CONTENT_ENCODING'] ?? 'not set';
-        $decodedContentLength = $_SERVER['HTTP_X_AMZ_DECODED_CONTENT_LENGTH'] ?? 'not set';
-        Logger::debug("[readBody] Content-Length: {$contentLength}, Transfer-Encoding: {$transferEncoding}, Content-Encoding: {$contentEncoding}, X-Amz-Decoded-Content-Length: {$decodedContentLength}");
 
         $body = file_get_contents('php://input');
-        $rawLength = strlen($body);
-        Logger::debug("[readBody] Raw body length from php://input: {$rawLength}");
-
-        // 如果 php://input 为空，但请求使用 chunked 编码，尝试从 stdin 读取
-        if (($body === false || $body === '') && ($transferEncoding === 'chunked' || $contentEncoding === 'aws-chunked')) {
-            Logger::debug("[readBody] php://input is empty, trying alternative methods...");
-            
-            // 方法1: 尝试从 php://stdin 读取
-            $stdinBody = @file_get_contents('php://stdin');
-            if ($stdinBody !== false && strlen($stdinBody) > 0) {
-                Logger::debug("[readBody] Read " . strlen($stdinBody) . " bytes from php://stdin");
-                $body = $stdinBody;
-            }
-        }
 
         if ($body === false || $body === '') {
-            Logger::debug("[readBody] Body is empty, returning empty string");
             return '';
         }
 
-        // Log first 200 bytes in hex for debugging chunked encoding
-        $hexPreview = bin2hex(substr($body, 0, 200));
-        Logger::debug("[readBody] Body hex preview (first 200 bytes): {$hexPreview}");
+        // Decide chunked decoding by headers, not by body content sniffing.
+        // Sniffing the body is unsafe: a binary PUT whose first bytes happen to
+        // look like a hex chunk size would be silently truncated.
+        $contentEncoding = $this->getHeader('Content-Encoding');
+        $transferEncoding = $this->getHeader('Transfer-Encoding');
 
-        // Check if body starts with hex number (chunked encoding marker)
-        $isChunkedPattern = preg_match('/^[0-9a-fA-F]+\r\n/', $body) === 1;
-        $isAwsChunkedPattern = preg_match('/^[0-9a-fA-F]+;chunk-signature=/', $body) === 1;
-        Logger::debug("[readBody] Is chunked pattern: " . ($isChunkedPattern ? 'yes' : 'no') . ", Is aws-chunked: " . ($isAwsChunkedPattern ? 'yes' : 'no'));
-
-        // 检测 aws-chunked 编码
-        if ($isAwsChunkedPattern || $contentEncoding === 'aws-chunked') {
-            Logger::debug("[readBody] Detected aws-chunked encoding, decoding...");
-            $decodedBody = $this->decodeAwsChunked($body);
-            $decodedLength = strlen($decodedBody);
-            Logger::debug("[readBody] Decoded aws-chunked body length: {$decodedLength}");
-            return $decodedBody;
+        if ($contentEncoding !== null && stripos($contentEncoding, 'aws-chunked') !== false) {
+            return $this->decodeAwsChunked($body);
         }
 
-        if ($this->isChunked($body)) {
-            Logger::debug("[readBody] Detected standard chunked encoding, decoding...");
-            $decodedBody = $this->decodeChunked($body);
-            $decodedLength = strlen($decodedBody);
-            Logger::debug("[readBody] Decoded body length: {$decodedLength}");
-            return $decodedBody;
+        if ($transferEncoding !== null && stripos($transferEncoding, 'chunked') !== false) {
+            return $this->decodeChunked($body);
         }
 
-        Logger::debug("[readBody] Returning raw body, length: {$rawLength}");
         return $body;
-    }
-
-    private function isChunked(string $body): bool
-    {
-        return preg_match('/^[0-9a-fA-F]+\r\n/', $body) === 1;
     }
 
     private function decodeChunked(string $body): string
@@ -326,30 +159,25 @@ class Request
                 break;
             }
 
-            $sizeHex = substr($body, $pos, $lineEnd - $pos);
-            $size = hexdec(trim($sizeHex));
-
+            $size = hexdec(trim(substr($body, $pos, $lineEnd - $pos)));
             if ($size === 0) {
                 break;
             }
 
             $dataStart = $lineEnd + 2;
-            $dataEnd = $dataStart + $size;
-
-            if ($dataEnd > $len) {
+            if ($dataStart + $size > $len) {
                 break;
             }
 
             $decoded .= substr($body, $dataStart, $size);
-            $pos = $dataEnd + 2;
+            $pos = $dataStart + $size + 2;
         }
 
         return $decoded;
     }
 
     /**
-     * 解码 AWS chunked 编码
-     * 格式: hex(size);chunk-signature=signature\r\n data\r\n
+     * Decode AWS chunked encoding: hex(size);chunk-signature=signature\r\n data\r\n
      */
     private function decodeAwsChunked(string $body): string
     {
@@ -357,56 +185,31 @@ class Request
         $pos = 0;
         $len = strlen($body);
 
-        Logger::debug("[decodeAwsChunked] Starting to decode aws-chunked body, length: {$len}");
-
         while ($pos < $len) {
-            // 查找 chunk 头结束位置
             $lineEnd = strpos($body, "\r\n", $pos);
             if ($lineEnd === false) {
-                Logger::debug("[decodeAwsChunked] No more chunks found at position {$pos}");
                 break;
             }
 
-            // 解析 chunk 头: hex(size);chunk-signature=...
             $chunkHeader = substr($body, $pos, $lineEnd - $pos);
-            Logger::debug("[decodeAwsChunked] Chunk header: {$chunkHeader}");
-
-            // 提取大小（在分号之前）
             $semicolonPos = strpos($chunkHeader, ';');
-            if ($semicolonPos === false) {
-                // 可能是标准 chunked 编码
-                $sizeHex = trim($chunkHeader);
-            } else {
-                $sizeHex = trim(substr($chunkHeader, 0, $semicolonPos));
-            }
+            $sizeHex = $semicolonPos !== false
+                ? trim(substr($chunkHeader, 0, $semicolonPos))
+                : trim($chunkHeader);
 
             $size = hexdec($sizeHex);
-            Logger::debug("[decodeAwsChunked] Chunk size: {$size}");
-
             if ($size === 0) {
-                // 结束块，后面可能有 trailer
-                Logger::debug("[decodeAwsChunked] Found end chunk");
                 break;
             }
 
             $dataStart = $lineEnd + 2;
-            $dataEnd = $dataStart + $size;
-
-            if ($dataEnd > $len) {
-                Logger::debug("[decodeAwsChunked] Chunk data exceeds body length");
+            if ($dataStart + $size > $len) {
                 break;
             }
 
-            $chunkData = substr($body, $dataStart, $size);
-            $decoded .= $chunkData;
-            Logger::debug("[decodeAwsChunked] Added {$size} bytes to decoded body");
-
-            // 跳过 chunk 数据后的 \r\n
-            $pos = $dataEnd + 2;
+            $decoded .= substr($body, $dataStart, $size);
+            $pos = $dataStart + $size + 2;
         }
-
-        $decodedLen = strlen($decoded);
-        Logger::debug("[decodeAwsChunked] Decoded body length: {$decodedLen}");
 
         return $decoded;
     }
@@ -445,15 +248,8 @@ class Request
 
     public function getHeader(string $name): ?string
     {
-        $key = strtoupper(str_replace('-', '_', $name));
-        
-        foreach ($this->headers as $headerKey => $value) {
-            if (strcasecmp($headerKey, $key) === 0 || strcasecmp($headerKey, $name) === 0) {
-                return $value;
-            }
-        }
-        
-        return null;
+        // O(1) case-insensitive lookup via the prebuilt lowercased map.
+        return $this->lowerHeaders[strtolower($name)] ?? null;
     }
 
     public function getHeaders(): array
@@ -463,7 +259,10 @@ class Request
 
     public function getBody(): string
     {
-        return $this->body;
+        // Lazy read: php://input is only opened on first getBody() call, so
+        // HEAD/GET/list requests never touch the request body, and an early
+        // size-check in Router can reject oversized PUTs before they load.
+        return $this->body ??= $this->readBody();
     }
 
     public function getBucket(): string

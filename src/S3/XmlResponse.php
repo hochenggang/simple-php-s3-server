@@ -2,89 +2,101 @@
 
 namespace S3Gateway\S3;
 
-use S3Gateway\Config;
+use Spatie\ArrayToXml\ArrayToXml;
 
 class XmlResponse
 {
     private static string $xmlNs = 'http://s3.amazonaws.com/doc/2006-03-01/';
 
+    /**
+     * Build root element config with xmlns attribute
+     */
+    private static function rootElement(string $name): array
+    {
+        return [
+            'rootElementName' => $name,
+            '_attributes' => ['xmlns' => self::$xmlNs],
+        ];
+    }
+
     public static function error(string $code, string $message, string $resource = ''): string
     {
-        $requestId = bin2hex(random_bytes(8));
-        $code = self::escape($code);
-        $message = self::escape($message);
-        $resource = self::escape($resource);
-
-        return <<<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<Error>
-    <Code>{$code}</Code>
-    <Message>{$message}</Message>
-    <Resource>{$resource}</Resource>
-    <RequestId>{$requestId}</RequestId>
-</Error>
-XML;
+        return ArrayToXml::convert([
+            'Code' => $code,
+            'Message' => $message,
+            'Resource' => $resource,
+            'RequestId' => bin2hex(random_bytes(8)),
+        ], self::rootElement('Error'), false);
     }
 
     public static function listBuckets(array $buckets, string $dataDir): string
     {
-        $xmlNs = self::$xmlNs;
-        $xml = <<<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<ListAllMyBucketsResult xmlns="{$xmlNs}">
-    <Owner>
-        <ID>s3-server</ID>
-        <DisplayName>s3-server</DisplayName>
-    </Owner>
-    <Buckets>
-XML;
-
+        $bucketNodes = [];
         foreach ($buckets as $bucket) {
-            $bucketName = self::escape($bucket);
-            $creationDate = date('Y-m-d\TH:i:s.000\Z', @filemtime($dataDir . '/' . $bucket) ?: time());
-            $xml .= "        <Bucket><Name>{$bucketName}</Name><CreationDate>{$creationDate}</CreationDate></Bucket>\n";
+            $creationDate = gmdate('Y-m-d\TH:i:s.000\Z', @filemtime($dataDir . '/' . $bucket) ?: time());
+            $bucketNodes[] = [
+                'Name' => $bucket,
+                'CreationDate' => $creationDate,
+            ];
         }
 
-        $xml .= <<<XML
-    </Buckets>
-</ListAllMyBucketsResult>
-XML;
-        return $xml;
+        $data = [
+            'Owner' => [
+                'ID' => 's3-server',
+                'DisplayName' => 's3-server',
+            ],
+            'Buckets' => empty($bucketNodes) ? [] : ['Bucket' => $bucketNodes],
+        ];
+
+        return ArrayToXml::convert($data, self::rootElement('ListAllMyBucketsResult'), false);
     }
 
-    public static function listObjects(array $files, string $bucket, string $prefix = ''): string
-    {
-        $xmlNs = self::$xmlNs;
-        $bucket = self::escape($bucket);
-        $prefix = self::escape($prefix);
+    public static function listObjects(
+        array $files,
+        string $bucket,
+        string $prefix = '',
+        int $maxKeys = 1000,
+        string $marker = '',
+        string $delimiter = '',
+        array $commonPrefixes = [],
+        bool $isTruncated = false,
+        string $encodingType = '',
+        string $nextMarker = ''
+    ): string {
+        $data = [
+            'Name' => $bucket,
+            'Prefix' => $prefix,
+            'MaxKeys' => (string)$maxKeys,
+            'IsTruncated' => $isTruncated ? 'true' : 'false',
+        ];
 
-        $xml = <<<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="{$xmlNs}">
-    <Name>{$bucket}</Name>
-    <Prefix>{$prefix}</Prefix>
-    <MaxKeys>1000</MaxKeys>
-    <IsTruncated>false</IsTruncated>
-XML;
-
-        foreach ($files as $file) {
-            $key = self::escape($file['key']);
-            $lastModified = date('Y-m-d\TH:i:s.000\Z', $file['timestamp']);
-            $size = (int)$file['size'];
-            $etag = self::escape($file['etag'] ?? '');
-            $xml .= <<<XML
-    <Contents>
-        <Key>{$key}</Key>
-        <LastModified>{$lastModified}</LastModified>
-        <Size>{$size}</Size>
-        <ETag>{$etag}</ETag>
-        <StorageClass>STANDARD</StorageClass>
-    </Contents>
-XML;
+        if ($marker !== '') {
+            $data['Marker'] = $marker;
         }
 
-        $xml .= "</ListBucketResult>";
-        return $xml;
+        if ($delimiter !== '') {
+            $data['Delimiter'] = $delimiter;
+        }
+
+        if ($encodingType !== '') {
+            $data['EncodingType'] = $encodingType;
+        }
+
+        if ($isTruncated && $delimiter !== '' && $nextMarker !== '') {
+            $data['NextMarker'] = $nextMarker;
+        }
+
+        $contents = self::buildContentsArray($files, $encodingType);
+        if (!empty($contents)) {
+            $data['Contents'] = $contents;
+        }
+
+        $cpNodes = self::buildCommonPrefixesArray($commonPrefixes, $encodingType);
+        if (!empty($cpNodes)) {
+            $data['CommonPrefixes'] = $cpNodes;
+        }
+
+        return ArrayToXml::convert($data, self::rootElement('ListBucketResult'), false);
     }
 
     public static function listObjectsV2(
@@ -95,183 +107,194 @@ XML;
         string $continuationToken = '',
         string $nextContinuationToken = '',
         string $startAfter = '',
-        bool $fetchOwner = false
+        bool $fetchOwner = false,
+        string $delimiter = '',
+        array $commonPrefixes = [],
+        string $encodingType = ''
     ): string {
-        $xmlNs = self::$xmlNs;
+        $isTruncated = $nextContinuationToken !== '';
         $keyCount = count($files);
-        $isTruncated = $nextContinuationToken ? 'true' : 'false';
 
-        $bucket = self::escape($bucket);
-        $prefix = self::escape($prefix);
+        $data = [
+            'Name' => $bucket,
+            'Prefix' => $prefix,
+            'MaxKeys' => (string)$maxKeys,
+            'KeyCount' => (string)$keyCount,
+            'IsTruncated' => $isTruncated ? 'true' : 'false',
+        ];
 
-        $xml = <<<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="{$xmlNs}">
-    <Name>{$bucket}</Name>
-    <Prefix>{$prefix}</Prefix>
-    <MaxKeys>{$maxKeys}</MaxKeys>
-    <KeyCount>{$keyCount}</KeyCount>
-    <IsTruncated>{$isTruncated}</IsTruncated>
-XML;
-
-        if ($continuationToken) {
-            $xml .= "    <ContinuationToken>" . self::escape($continuationToken) . "</ContinuationToken>\n";
+        if ($delimiter !== '') {
+            $data['Delimiter'] = $delimiter;
         }
 
-        if ($startAfter) {
-            $xml .= "    <StartAfter>" . self::escape($startAfter) . "</StartAfter>\n";
+        if ($encodingType !== '') {
+            $data['EncodingType'] = $encodingType;
         }
 
-        if ($nextContinuationToken) {
-            $xml .= "    <NextContinuationToken>" . self::escape($nextContinuationToken) . "</NextContinuationToken>\n";
+        if ($continuationToken !== '') {
+            $data['ContinuationToken'] = $continuationToken;
         }
 
+        if ($startAfter !== '') {
+            $data['StartAfter'] = $startAfter;
+        }
+
+        if ($nextContinuationToken !== '') {
+            $data['NextContinuationToken'] = $nextContinuationToken;
+        }
+
+        $contents = self::buildContentsArray($files, $encodingType, $fetchOwner);
+        if (!empty($contents)) {
+            $data['Contents'] = $contents;
+        }
+
+        $cpNodes = self::buildCommonPrefixesArray($commonPrefixes, $encodingType);
+        if (!empty($cpNodes)) {
+            $data['CommonPrefixes'] = $cpNodes;
+        }
+
+        return ArrayToXml::convert($data, self::rootElement('ListBucketResult'), false);
+    }
+
+    /**
+     * Build Contents child array for XML
+     * Returns an array suitable for spatie/array-to-xml repeated element handling
+     */
+    private static function buildContentsArray(array $files, string $encodingType = '', bool $fetchOwner = false): array
+    {
+        $contents = [];
         foreach ($files as $file) {
-            $key = self::escape($file['key']);
-            $lastModified = date('Y-m-d\TH:i:s.000\Z', $file['timestamp']);
-            $size = (int)$file['size'];
-            $etag = self::escape($file['etag'] ?? '');
-            $xml .= <<<XML
-    <Contents>
-        <Key>{$key}</Key>
-        <LastModified>{$lastModified}</LastModified>
-        <Size>{$size}</Size>
-        <ETag>{$etag}</ETag>
-        <StorageClass>STANDARD</StorageClass>
-XML;
-            if ($fetchOwner) {
-                $xml .= "        <Owner><ID>s3-server</ID><DisplayName>s3-server</DisplayName></Owner>\n";
+            $key = $file['key'];
+            if ($encodingType === 'url') {
+                $key = rawurlencode($key);
             }
-            $xml .= "    </Contents>\n";
+
+            $content = [
+                'Key' => $key,
+                'LastModified' => gmdate('Y-m-d\TH:i:s.000\Z', $file['timestamp']),
+                'ETag' => self::formatEtag($file['etag'] ?? ''),
+                'Size' => (string)(int)$file['size'],
+                'StorageClass' => 'STANDARD',
+            ];
+
+            if ($fetchOwner) {
+                $content['Owner'] = [
+                    'ID' => 's3-server',
+                    'DisplayName' => 's3-server',
+                ];
+            }
+
+            $contents[] = $content;
         }
 
-        $xml .= "</ListBucketResult>";
-        return $xml;
+        return $contents;
+    }
+
+    /**
+     * Build CommonPrefixes child array for XML
+     */
+    private static function buildCommonPrefixesArray(array $commonPrefixes, string $encodingType = ''): array
+    {
+        $nodes = [];
+        foreach ($commonPrefixes as $prefix) {
+            if ($encodingType === 'url') {
+                $prefix = rawurlencode($prefix);
+            }
+            $nodes[] = ['Prefix' => $prefix];
+        }
+        return $nodes;
     }
 
     public static function createMultipartUpload(string $bucket, string $key, string $uploadId): string
     {
-        $xmlNs = self::$xmlNs;
-        $bucket = self::escape($bucket);
-        $key = self::escape($key);
-
-        return <<<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<InitiateMultipartUploadResult xmlns="{$xmlNs}">
-    <Bucket>{$bucket}</Bucket>
-    <Key>{$key}</Key>
-    <UploadId>{$uploadId}</UploadId>
-</InitiateMultipartUploadResult>
-XML;
+        return ArrayToXml::convert([
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+        ], self::rootElement('InitiateMultipartUploadResult'), false);
     }
 
     public static function completeMultipartUpload(string $bucket, string $key, string $location, string $etag, int $size): string
     {
-        $xmlNs = self::$xmlNs;
-        $bucket = self::escape($bucket);
-        $key = self::escape($key);
-        $location = self::escape($location);
-        $etag = self::escape($etag);
-        if (strpos($etag, '"') !== 0) {
-            $etag = '"' . $etag . '"';
-        }
-
-        return <<<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<CompleteMultipartUploadResult xmlns="{$xmlNs}">
-    <Location>{$location}</Location>
-    <Bucket>{$bucket}</Bucket>
-    <Key>{$key}</Key>
-    <ETag>{$etag}</ETag>
-    <Size>{$size}</Size>
-</CompleteMultipartUploadResult>
-XML;
+        return ArrayToXml::convert([
+            'Location' => $location,
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'ETag' => self::formatEtag($etag),
+            'Size' => (string)$size,
+        ], self::rootElement('CompleteMultipartUploadResult'), false);
     }
 
     public static function listParts(string $bucket, string $key, string $uploadId, array $parts): string
     {
-        $xmlNs = self::$xmlNs;
-        $bucket = self::escape($bucket);
-        $key = self::escape($key);
-        $uploadId = self::escape($uploadId);
-
-        $xml = <<<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<ListPartsResult xmlns="{$xmlNs}">
-    <Bucket>{$bucket}</Bucket>
-    <Key>{$key}</Key>
-    <UploadId>{$uploadId}</UploadId>
-    <MaxParts>1000</MaxParts>
-    <IsTruncated>false</IsTruncated>
-XML;
-
+        $partNodes = [];
         foreach ($parts as $part) {
-            $number = (int)$part['number'];
-            $lastModified = date('Y-m-d\TH:i:s.000\Z', $part['mtime'] ?? $part['timestamp']);
-            $etag = $part['etag'];
-            if (strpos($etag, '"') !== 0) {
-                $etag = '"' . $etag . '"';
-            }
-            $etag = self::escape($etag);
-            $size = (int)$part['size'];
-            $xml .= <<<XML
-    <Part>
-        <PartNumber>{$number}</PartNumber>
-        <LastModified>{$lastModified}</LastModified>
-        <ETag>{$etag}</ETag>
-        <Size>{$size}</Size>
-    </Part>
-XML;
+            $partNodes[] = [
+                'PartNumber' => (string)(int)$part['number'],
+                'LastModified' => gmdate('Y-m-d\TH:i:s.000\Z', $part['mtime'] ?? $part['timestamp']),
+                'ETag' => self::formatEtag($part['etag']),
+                'Size' => (string)(int)$part['size'],
+            ];
         }
 
-        $xml .= "</ListPartsResult>";
-        return $xml;
+        $data = [
+            'Bucket' => $bucket,
+            'Key' => $key,
+            'UploadId' => $uploadId,
+            'MaxParts' => '1000',
+            'IsTruncated' => 'false',
+        ];
+
+        if (!empty($partNodes)) {
+            $data['Part'] = $partNodes;
+        }
+
+        return ArrayToXml::convert($data, self::rootElement('ListPartsResult'), false);
     }
 
     public static function copyObject(string $etag, int $lastModified): string
     {
-        $xmlNs = self::$xmlNs;
-        $lastModifiedStr = date('Y-m-d\TH:i:s.000\Z', $lastModified);
-        if (strpos($etag, '"') !== 0) {
-            $etag = '"' . $etag . '"';
-        }
-        $etag = self::escape($etag);
-
-        return <<<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<CopyObjectResult xmlns="{$xmlNs}">
-    <LastModified>{$lastModifiedStr}</LastModified>
-    <ETag>{$etag}</ETag>
-</CopyObjectResult>
-XML;
+        return ArrayToXml::convert([
+            'LastModified' => gmdate('Y-m-d\TH:i:s.000\Z', $lastModified),
+            'ETag' => self::formatEtag($etag),
+        ], self::rootElement('CopyObjectResult'), false);
     }
 
     public static function deleteObjects(array $deleted, array $errors): string
     {
-        $xmlNs = self::$xmlNs;
-        $xml = <<<XML
-<?xml version="1.0" encoding="UTF-8"?>
-<DeleteResult xmlns="{$xmlNs}">
-XML;
+        $data = [];
 
+        $deletedNodes = [];
         foreach ($deleted as $key) {
-            $key = self::escape($key);
-            $xml .= "    <Deleted><Key>{$key}</Key></Deleted>\n";
+            $deletedNodes[] = ['Key' => $key];
+        }
+        if (!empty($deletedNodes)) {
+            $data['Deleted'] = $deletedNodes;
         }
 
+        $errorNodes = [];
         foreach ($errors as $error) {
-            $key = self::escape($error['key']);
-            $code = self::escape($error['code']);
-            $message = self::escape($error['message']);
-            $xml .= "    <Error><Key>{$key}</Key><Code>{$code}</Code><Message>{$message}</Message></Error>\n";
+            $errorNodes[] = [
+                'Key' => $error['key'],
+                'Code' => $error['code'],
+                'Message' => $error['message'],
+            ];
+        }
+        if (!empty($errorNodes)) {
+            $data['Error'] = $errorNodes;
         }
 
-        $xml .= "</DeleteResult>";
-        return $xml;
+        return ArrayToXml::convert($data, self::rootElement('DeleteResult'), false);
     }
 
-    private static function escape(string $value): string
+    /**
+     * Format ETag with surrounding quotes if not already present
+     */
+    private static function formatEtag(string $etag): string
     {
-        return htmlspecialchars($value, ENT_XML1 | ENT_QUOTES, 'UTF-8');
+        if ($etag !== '' && !str_starts_with($etag, '"')) {
+            return '"' . $etag . '"';
+        }
+        return $etag;
     }
 }

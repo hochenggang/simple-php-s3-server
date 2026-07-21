@@ -11,23 +11,13 @@ error_reporting(E_ALL);
 
 define('ERROR_LOG_FILE', __DIR__ . '/error_log');
 
-require_once __DIR__ . '/src/Logger.php';
-require_once __DIR__ . '/src/Config.php';
+require_once __DIR__ . '/vendor/autoload.php';
+
+// All timestamps (logs, XML CreationDate/LastModified, HTTP Last-Modified) use UTC
+// to match the "Z" suffix emitted by XmlResponse and the RFC 7232 HTTP-date spec.
+date_default_timezone_set('UTC');
 
 S3Gateway\Logger::init(ERROR_LOG_FILE);
-
-// 立即记录一些初始化信息
-S3Gateway\Logger::info("=== S3 Gateway Initializing ===");
-S3Gateway\Logger::info("PHP Version: " . phpversion());
-S3Gateway\Logger::info("Error log file: " . ERROR_LOG_FILE);
-
-// 测试配置加载
-try {
-    $appDebug = S3Gateway\Config::appDebug();
-    S3Gateway\Logger::info("Config loaded - APP_DEBUG: " . var_export($appDebug, true));
-} catch (Exception $e) {
-    S3Gateway\Logger::error("Error loading config: " . $e->getMessage());
-}
 
 set_error_handler(function($errno, $errstr, $errfile, $errline) {
     S3Gateway\Logger::error(sprintf("Error [%d]: %s in %s:%d", $errno, $errstr, $errfile, $errline));
@@ -36,28 +26,11 @@ set_error_handler(function($errno, $errstr, $errfile, $errline) {
 
 set_exception_handler(function($e) {
     S3Gateway\Logger::exception($e, 'Uncaught Exception');
-    
+
     http_response_code(500);
     header('Content-Type: application/xml');
     echo '<?xml version="1.0" encoding="UTF-8"?>';
     echo '<Error><Code>InternalError</Code><Message>' . $e->getMessage() . '</Message></Error>';
-});
-
-spl_autoload_register(function ($class) {
-    $prefix = 'S3Gateway\\';
-    $baseDir = __DIR__ . '/src/';
-    
-    $len = strlen($prefix);
-    if (strncmp($prefix, $class, $len) !== 0) {
-        return;
-    }
-    
-    $relativeClass = substr($class, $len);
-    $file = $baseDir . str_replace('\\', '/', $relativeClass) . '.php';
-    
-    if (file_exists($file)) {
-        require $file;
-    }
 });
 
 use S3Gateway\Http\Router;

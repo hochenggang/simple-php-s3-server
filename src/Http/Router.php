@@ -41,6 +41,9 @@ class Router
                 return;
             }
 
+            // 早期 Content-Length 拒绝：在认证和读 body 之前，基于头直接拒绝超大请求
+            $this->authenticator->checkEarlyRequestSize();
+
             $accessKeyId = $this->authenticator->authenticate();
             $this->authenticator->checkRequestSize($accessKeyId);
 

@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>S3 对象存储测试</title>
+<!-- Vue3 global build（UMD，全局 Vue 对象） -->
+<script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.js"></script>
+<!-- AWS SDK v2 UMD bundle（浏览器原生支持，自带 Node polyfill，全局 AWS 对象） -->
+<script src="https://cdn.jsdelivr.net/npm/aws-sdk@2.1691.0/dist/aws-sdk.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    background: #f5f7fa;
+    color: #2c3e50;
+    line-height: 1.5;
+    min-height: 100vh;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 28px;
+    background: #fff;
+    border-bottom: 1px solid #e4e7eb;
+    box-shadow: 0 1px 3px rgba(0,0,0,.04);
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header h1 { font-size: 20px; font-weight: 600; }
+  .fab {
+    width: 44px; height: 44px;
+    border-radius: 50%;
+    border: none;
+    background: #2563eb;
+    color: #fff;
+    font-size: 22px;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(37,99,235,.35);
+    transition: transform .15s, background .15s;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .fab:hover { background: #1d4ed8; transform: scale(1.06); }
+  main { max-width: 1100px; margin: 0 auto; padding: 28px; }
+  .empty-hint {
+    text-align: center;
+    color: #94a3b8;
+    padding: 80px 20px;
+    font-size: 15px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 16px;
+  }
+  .card {
+    background: #fff;
+    border: 1px solid #e4e7eb;
+    border-radius: 12px;
+    padding: 18px;
+    cursor: pointer;
+    transition: transform .15s, box-shadow .15s, border-color .15s;
+  }
+  .card:hover { transform: translateY(-2px); box-shadow: 0 6px 18px rgba(0,0,0,.07); border-color: #cbd5e1; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .card-name { font-weight: 600; font-size: 16px; color: #1e293b; }
+  .card-endpoint { margin-top: 6px; font-size: 13px; color: #64748b; word-break: break-all; }
+  .icon-btn {
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    font-size: 16px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    transition: background .15s;
+    line-height: 1;
+  }
+  .icon-btn:hover { background: #f1f5f9; }
+  .icon-btn.danger:hover { background: #fee2e2; }
+
+  .modal-mask {
+    position: fixed; inset: 0;
+    background: rgba(15,23,42,.55);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 100;
+    padding: 20px;
+  }
+  .modal {
+    background: #fff;
+    border-radius: 14px;
+    padding: 24px;
+    width: 100%;
+    max-width: 460px;
+    max-height: 85vh;
+    overflow-y: auto;
+    box-shadow: 0 20px 50px rgba(0,0,0,.25);
+    animation: pop .15s ease-out;
+  }
+  .modal-lg { max-width: 760px; }
+  @keyframes pop { from { transform: scale(.96); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  .modal h3 { font-size: 17px; margin-bottom: 16px; color: #1e293b; }
+  .modal label {
+    display: block;
+    font-size: 13px;
+    color: #475569;
+    margin-bottom: 12px;
+  }
+  .modal label span { display: block; margin-bottom: 4px; font-weight: 500; }
+  .modal input {
+    width: 100%;
+    padding: 9px 12px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    font-size: 14px;
+    outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .modal input:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
+  .modal-actions {
+    display: flex; justify-content: flex-end; gap: 10px;
+    margin-top: 18px;
+  }
+  .btn {
+    padding: 8px 18px;
+    border: 1px solid #cbd5e1;
+    background: #fff;
+    border-radius: 8px;
+    font-size: 14px;
+    cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  .btn:hover { background: #f8fafc; }
+  .btn.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .btn.primary:hover { background: #1d4ed8; }
+
+  .list { display: flex; flex-direction: column; gap: 4px; }
+  .list-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 12px;
+    border: 1px solid #e4e7eb;
+    border-radius: 8px;
+    transition: background .12s;
+  }
+  .list-item:hover { background: #f8fafc; }
+  .list-item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .obj-key { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+  .obj-size { color: #94a3b8; font-size: 12px; white-space: nowrap; }
+  .icon-group { display: flex; gap: 2px; }
+
+  .loading { text-align: center; color: #64748b; padding: 30px 0; }
+  .empty-line { text-align: center; color: #94a3b8; padding: 24px 0; font-size: 14px; }
+  .error {
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: #fef2f2;
+    color: #b91c1c;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    font-size: 13px;
+    word-break: break-word;
+  }
+  .meta-pre {
+    background: #0f172a; color: #e2e8f0;
+    padding: 14px; border-radius: 8px;
+    font-size: 12px; font-family: 'SFMono-Regular', Consolas, monospace;
+    overflow: auto; max-height: 50vh; white-space: pre-wrap; word-break: break-all;
+  }
+  .presign-result { margin-top: 12px; }
+  .presign-result textarea {
+    width: 100%; padding: 10px; font-size: 12px;
+    border: 1px solid #cbd5e1; border-radius: 8px;
+    font-family: 'SFMono-Regular', Consolas, monospace;
+    word-break: break-all; resize: vertical;
+  }
+  .presign-result a { display: inline-block; margin-top: 8px; color: #2563eb; font-size: 13px; }
+  .sub-line { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+
+  .file-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    border: 1px dashed #cbd5e1;
+    border-radius: 8px;
+    cursor: pointer;
+    color: #475569;
+    transition: border-color .15s, background .15s;
+  }
+  .file-label:hover { border-color: #2563eb; background: #f8fafc; }
+  .file-label input[type="file"] { display: none; }
+  .file-name {
+    margin-top: 12px;
+    font-size: 13px;
+    color: #1e293b;
+    word-break: break-all;
+  }
+
+  .pagination-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 14px;
+    margin-top: 18px;
+    padding-top: 14px;
+    border-top: 1px solid #e4e7eb;
+  }
+  .pagination-bar label {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 13px; color: #475569;
+    margin: 0;
+  }
+  .pagination-bar label span { font-weight: 500; }
+  .pagination-bar select {
+    padding: 6px 10px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    font-size: 13px;
+    outline: none;
+    background: #fff;
+  }
+  .pagination-bar select:focus { border-color: #2563eb; }
+  .page-nav { display: flex; align-items: center; gap: 10px; }
+  .page-info { font-size: 13px; color: #64748b; }
+  .btn:disabled {
+    opacity: .55;
+    cursor: not-allowed;
+  }
+
+  .loading-banner {
+    position: fixed; top: 0; left: 0; right: 0;
+    background: #2563eb; color: #fff; text-align: center;
+    padding: 6px; font-size: 13px; z-index: 200;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div v-if="sdkLoading" class="loading-banner">正在加载 AWS SDK…</div>
+  <header>
+    <h1>S3 对象存储测试</h1>
+    <button class="fab" @click="openAddProvider" title="添加 S3 供应商">＋</button>
+  </header>
+
+  <main>
+    <div v-if="providers.length === 0" class="empty-hint">
+      点击右上角加号，添加你的第一个 S3 供应商
+    </div>
+    <div v-else class="grid">
+      <div v-for="p in providers" :key="p.id" class="card" @click="listBuckets(p)">
+        <div class="card-head">
+          <span class="card-name">{{ p.name }}</span>
+          <button class="icon-btn danger" @click.stop="removeProvider(p.id)" title="删除供应商">🗑️</button>
+        </div>
+        <div class="card-endpoint">{{ p.endpoint }}</div>
+      </div>
+    </div>
+  </main>
+
+  <!-- 添加 S3 供应商 -->
+  <div v-if="showAddProvider" class="modal-mask" @click.self="showAddProvider = false">
+    <div class="modal">
+      <h3>添加 S3 供应商</h3>
+      <label><span>名称</span><input v-model="form.name" placeholder="例如：本地网关"></label>
+      <label><span>Endpoint</span><input v-model="form.endpoint" placeholder="http://localhost:8000"></label>
+      <label><span>Access Key</span><input v-model="form.key"></label>
+      <label><span>Secret Key</span><input v-model="form.secret" type="password"></label>
+      <div v-if="error" class="error">{{ error }}</div>
+      <div class="modal-actions">
+        <button class="btn" @click="showAddProvider = false">取消</button>
+        <button class="btn primary" @click="saveProvider">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 桶列表 -->
+  <div v-if="showBuckets" class="modal-mask" @click.self="showBuckets = false">
+    <div class="modal">
+      <h3>{{ currentProvider && currentProvider.name }} 的桶列表</h3>
+      <div v-if="loading" class="loading">加载中…</div>
+      <div v-else-if="buckets.length === 0" class="empty-line">暂无桶</div>
+      <div v-else class="list">
+        <div v-for="b in buckets" :key="b.Name" class="list-item">
+          <span class="name">{{ b.Name }}</span>
+          <div class="icon-group">
+            <button class="btn primary" @click="listObjects(currentProvider, b.Name)">列出</button>
+            <button class="btn" @click="openUpload(b.Name)">上传</button>
+          </div>
+        </div>
+      </div>
+      <div v-if="error" class="error">{{ error }}</div>
+      <div class="modal-actions">
+        <button class="btn" @click="showBuckets = false">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 对象列表 -->
+  <div v-if="showObjects" class="modal-mask" @click.self="showObjects = false">
+    <div class="modal modal-lg">
+      <h3>{{ currentBucket }} 的对象列表</h3>
+      <div v-if="loading" class="loading">加载中…</div>
+      <div v-else-if="objects.length === 0" class="empty-line">暂无对象</div>
+      <div v-else class="list">
+        <div v-for="o in objects" :key="o.Key" class="list-item">
+          <span class="obj-key">📄 {{ o.Key }}</span>
+          <span class="obj-size">{{ formatSize(o.Size) }}</span>
+          <div class="icon-group">
+            <button class="icon-btn" @click="downloadObject(o)" title="下载">下载</button>
+            <button class="icon-btn danger" @click="deleteObject(o)" title="删除">删除</button>
+            <button class="icon-btn" @click="showMetadata(o)" title="元数据">元数据</button>
+            <button class="icon-btn" @click="openPresign(o)" title="预签名">预签名</button>
+          </div>
+        </div>
+      </div>
+      <div v-if="error" class="error">{{ error }}</div>
+
+      <!-- 分页与每页数量 -->
+      <div class="pagination-bar" v-if="!loading && objects.length > 0">
+        <div class="page-size">
+          <label>
+            <span>每页数量</span>
+            <select v-model.number="pageSize" @change="changePageSize">
+              <option :value="10">10</option>
+              <option :value="50">50</option>
+              <option :value="100">100</option>
+              <option :value="1000">1000</option>
+            </select>
+          </label>
+        </div>
+        <div class="page-nav">
+          <button class="btn" :disabled="pageTokens.length === 0" @click="prevPage">上一页</button>
+          <span class="page-info">第 {{ pageTokens.length + 1 }} 页</span>
+          <button class="btn" :disabled="!isTruncated" @click="nextPage">下一页</button>
+        </div>
+      </div>
+
+      <div class="modal-actions">
+        <button class="btn" @click="showObjects = false">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 上传对象 -->
+  <div v-if="showUpload" class="modal-mask" @click.self="showUpload = false">
+    <div class="modal">
+      <h3>上传对象到 {{ uploadBucket }}</h3>
+      <label class="file-label">
+        <input type="file" @change="onFileSelected">
+        <span>选择文件</span>
+      </label>
+      <div v-if="uploadFile" class="file-name">已选择：{{ uploadFile.name }}（{{ formatSize(uploadFile.size) }}）</div>
+      <div v-if="uploadLoading" class="loading">上传中…</div>
+      <div v-if="error" class="error">{{ error }}</div>
+      <div class="modal-actions">
+        <button class="btn" @click="showUpload = false" :disabled="uploadLoading">取消</button>
+        <button class="btn primary" @click="doUpload" :disabled="!uploadFile || uploadLoading">上传</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 元数据 -->
+  <div v-if="showMeta" class="modal-mask" @click.self="showMeta = false">
+    <div class="modal modal-lg">
+      <h3>对象元数据</h3>
+      <div v-if="loading" class="loading">加载中…</div>
+      <pre v-else class="meta-pre">{{ metaText }}</pre>
+      <div class="modal-actions">
+        <button class="btn" @click="showMeta = false">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 预签名 -->
+  <div v-if="showPresign" class="modal-mask" @click.self="showPresign = false">
+    <div class="modal">
+      <h3>生成预签名下载链接</h3>
+      <label>
+        <span>过期秒数</span>
+        <input type="number" v-model.number="presignExpires" min="1" placeholder="3600">
+      </label>
+      <button class="btn primary" @click="generatePresign">生成链接</button>
+      <div v-if="presignUrl" class="presign-result">
+        <textarea readonly rows="5" v-model="presignUrl"></textarea>
+        <a :href="presignUrl" target="_blank" rel="noopener">在新标签打开 ↗</a>
+      </div>
+      <div v-if="error" class="error">{{ error }}</div>
+      <div class="modal-actions">
+        <button class="btn" @click="showPresign = false">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  // 等待 AWS SDK UMD 加载完成（脚本在 head 中同步加载，此处 AWS 应已就绪）
+  const { createApp, ref, reactive } = Vue;
+  const AWS = window.AWS;
+  const STORAGE_KEY = 's3_providers';
+
+  if (!AWS) {
+    document.getElementById('app').innerHTML =
+      '<div style="padding:40px;text-align:center;color:#b91c1c">AWS SDK 加载失败，请检查网络后刷新页面。</div>';
+  } else {
+    createApp({
+      setup() {
+        const providers = ref(loadProviders());
+        const showAddProvider = ref(false);
+        const showBuckets = ref(false);
+        const showObjects = ref(false);
+        const showMeta = ref(false);
+        const showPresign = ref(false);
+        const showUpload = ref(false);
+
+        const form = reactive({ name: '', endpoint: '', key: '', secret: '' });
+        const currentProvider = ref(null);
+        const currentBucket = ref('');
+        const currentObject = ref(null);
+        const uploadBucket = ref('');
+        const uploadFile = ref(null);
+        const uploadLoading = ref(false);
+
+        const buckets = ref([]);
+        const objects = ref([]);
+        const pageSize = ref(50);                 // 每页对象数：10 / 50 / 100 / 1000
+        const pageTokens = ref([]);               // 上一页 ContinuationToken 栈
+        const isTruncated = ref(false);           // 当前页是否还能继续
+        const nextContinuationToken = ref('');    // 下一页 token
+        const loading = ref(false);
+        const error = ref('');
+        const metaText = ref('');
+        const presignExpires = ref(3600);
+        const presignUrl = ref('');
+
+        const clientCache = new Map();
+
+        function loadProviders() {
+          try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }
+          catch (e) { return []; }
+        }
+        function persist() {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(providers.value));
+        }
+
+        // 每个供应商缓存一个 S3 客户端实例
+        function getClient(p) {
+          if (!p) return null;
+          if (clientCache.has(p.id)) return clientCache.get(p.id);
+          const client = new AWS.S3({
+            endpoint: p.endpoint,
+            accessKeyId: p.key,
+            secretAccessKey: p.secret,
+            s3ForcePathStyle: true,   // S3 兼容网关使用 path-style 寻址
+            signatureVersion: 'v4',
+            region: p.region || 'us-east-1',
+          });
+          clientCache.set(p.id, client);
+          return client;
+        }
+
+        function clearError() { error.value = ''; }
+        function errMsg(e) {
+          return (e && (e.message || e.code || e.name)) || String(e);
+        }
+
+        function openAddProvider() {
+          Object.assign(form, { name: '', endpoint: '', key: '', secret: '' });
+          clearError();
+          showAddProvider.value = true;
+        }
+
+        function saveProvider() {
+          if (!form.name.trim() || !form.endpoint.trim() || !form.key.trim() || !form.secret.trim()) {
+            error.value = '请完整填写所有字段';
+            return;
+          }
+          providers.value.push({
+            id: 'p_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+            name: form.name.trim(),
+            endpoint: form.endpoint.trim(),
+            key: form.key.trim(),
+            secret: form.secret.trim(),
+          });
+          persist();
+          showAddProvider.value = false;
+        }
+
+        function removeProvider(id) {
+          if (!confirm('确定删除此供应商配置？')) return;
+          providers.value = providers.value.filter(p => p.id !== id);
+          clientCache.delete(id);
+          persist();
+        }
+
+        async function listBuckets(p) {
+          currentProvider.value = p;
+          clearError();
+          loading.value = true;
+          buckets.value = [];
+          showBuckets.value = true;
+          try {
+            const res = await getClient(p).listBuckets().promise();
+            buckets.value = res.Buckets || [];
+          } catch (e) {
+            error.value = errMsg(e);
+          } finally {
+            loading.value = false;
+          }
+        }
+
+        async function listObjects(p, bucket, token = '') {
+          currentProvider.value = p;
+          currentBucket.value = bucket;
+          clearError();
+          loading.value = true;
+          showObjects.value = true;
+          try {
+            const params = { Bucket: bucket, MaxKeys: pageSize.value };
+            if (token) params.ContinuationToken = token;
+            const res = await getClient(p).listObjectsV2(params).promise();
+            objects.value = res.Contents || [];
+            isTruncated.value = !!res.IsTruncated;
+            nextContinuationToken.value = res.NextContinuationToken || '';
+          } catch (e) {
+            error.value = errMsg(e);
+            objects.value = [];
+            isTruncated.value = false;
+            nextContinuationToken.value = '';
+          } finally {
+            loading.value = false;
+          }
+        }
+
+        // 下一页：记录下一页起始 token，然后用它请求
+        async function nextPage() {
+          if (!isTruncated.value || !nextContinuationToken.value) return;
+          pageTokens.value.push(nextContinuationToken.value);
+          await listObjects(currentProvider.value, currentBucket.value, nextContinuationToken.value);
+        }
+
+        // 上一页：回到上一页的起始 token
+        async function prevPage() {
+          if (pageTokens.value.length <= 1) {
+            pageTokens.value = [];
+            await listObjects(currentProvider.value, currentBucket.value, '');
+            return;
+          }
+          pageTokens.value.pop();
+          const token = pageTokens.value[pageTokens.value.length - 1];
+          await listObjects(currentProvider.value, currentBucket.value, token);
+        }
+
+        // 切换每页数量：重置分页状态并重新列出
+        async function changePageSize() {
+          pageTokens.value = [];
+          await listObjects(currentProvider.value, currentBucket.value, '');
+        }
+
+        // 上传相关
+        function openUpload(bucket) {
+          uploadBucket.value = bucket;
+          uploadFile.value = null;
+          clearError();
+          showUpload.value = true;
+        }
+
+        function onFileSelected(event) {
+          const files = event.target.files;
+          uploadFile.value = files && files.length ? files[0] : null;
+          clearError();
+        }
+
+        async function doUpload() {
+          if (!uploadFile.value || !uploadBucket.value) return;
+          clearError();
+          uploadLoading.value = true;
+          try {
+            await getClient(currentProvider.value).putObject({
+              Bucket: uploadBucket.value,
+              Key: uploadFile.value.name,
+              Body: uploadFile.value,
+              ContentType: uploadFile.value.type || 'application/octet-stream',
+            }).promise();
+            showUpload.value = false;
+            uploadFile.value = null;
+            // 如果当前正在查看同一个桶的对象列表，则刷新它
+            if (showObjects.value && currentBucket.value === uploadBucket.value) {
+              pageTokens.value = [];
+              await listObjects(currentProvider.value, currentBucket.value, '');
+            }
+          } catch (e) {
+            error.value = errMsg(e);
+          } finally {
+            uploadLoading.value = false;
+          }
+        }
+
+        function downloadObject(o) {
+          clearError();
+          try {
+            // v2 getSignedUrl 同步返回 URL
+            const url = getClient(currentProvider.value).getSignedUrl('getObject', {
+              Bucket: currentBucket.value,
+              Key: o.Key,
+              Expires: 60,
+            });
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = o.Key.split('/').pop() || 'download';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+          } catch (e) {
+            error.value = errMsg(e);
+          }
+        }
+
+        async function deleteObject(o) {
+          if (!confirm('确定删除对象 "' + o.Key + '"？此操作不可恢复。')) return;
+          clearError();
+          try {
+            await getClient(currentProvider.value).deleteObject({
+              Bucket: currentBucket.value,
+              Key: o.Key,
+            }).promise();
+            objects.value = objects.value.filter(x => x.Key !== o.Key);
+          } catch (e) {
+            error.value = errMsg(e);
+          }
+        }
+
+        async function showMetadata(o) {
+          currentObject.value = o;
+          clearError();
+          loading.value = true;
+          metaText.value = '';
+          showMeta.value = true;
+          try {
+            const res = await getClient(currentProvider.value).headObject({
+              Bucket: currentBucket.value,
+              Key: o.Key,
+            }).promise();
+            const meta = {
+              ContentType: res.ContentType,
+              ContentLength: res.ContentLength,
+              ETag: res.ETag,
+              LastModified: res.LastModified ? new Date(res.LastModified).toISOString() : null,
+              Metadata: res.Metadata || {},
+              VersionId: res.VersionId,
+              StorageClass: res.StorageClass,
+            };
+            metaText.value = JSON.stringify(meta, null, 2);
+          } catch (e) {
+            metaText.value = '获取失败: ' + errMsg(e);
+          } finally {
+            loading.value = false;
+          }
+        }
+
+        function openPresign(o) {
+          currentObject.value = o;
+          presignUrl.value = '';
+          presignExpires.value = 3600;
+          clearError();
+          showPresign.value = true;
+        }
+
+        function generatePresign() {
+          clearError();
+          presignUrl.value = '';
+          if (!presignExpires.value || presignExpires.value <= 0) {
+            error.value = '请输入有效的过期秒数';
+            return;
+          }
+          try {
+            // v2 getSignedUrl 同步生成
+            presignUrl.value = getClient(currentProvider.value).getSignedUrl('getObject', {
+              Bucket: currentBucket.value,
+              Key: currentObject.value.Key,
+              Expires: presignExpires.value,
+            });
+          } catch (e) {
+            error.value = errMsg(e);
+          }
+        }
+
+        function formatSize(bytes) {
+          if (bytes == null) return '';
+          if (bytes < 1024) return bytes + ' B';
+          if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+          if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+          return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+        }
+
+        return {
+          providers, showAddProvider, showBuckets, showObjects, showMeta, showPresign, showUpload,
+          form, currentProvider, currentBucket, currentObject, uploadBucket, uploadFile, uploadLoading,
+          buckets, objects, pageSize, pageTokens, isTruncated, nextContinuationToken,
+          loading, error, metaText, presignExpires, presignUrl,
+          openAddProvider, saveProvider, removeProvider,
+          listBuckets, listObjects, downloadObject, deleteObject, showMetadata,
+          openPresign, generatePresign, formatSize,
+          nextPage, prevPage, changePageSize,
+          openUpload, onFileSelected, doUpload,
+        };
+      },
+    }).mount('#app');
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,52 @@
+name: Release
+
+# 打 v* 标签时触发发布
+on:
+  push:
+    tags:
+      - 'v*'
+
+# 创建 release 需要写仓库内容的权限
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build source archive
+        run: |
+          PKG_NAME="${{ github.event.repository.name }}-${{ github.ref_name }}"
+          ARCHIVE="${PKG_NAME}.tar.gz"
+
+          # 打包当前目录，按需排除：
+          #   - 用户指定：tests / phpunit.xml / *.md
+          #   - 显而易见的开发工件：vendor / .git / .github / .trae / .vscode
+          #   - 压缩包产物自身：*.tar.gz
+          # --transform 给所有路径加上顶级目录前缀，解压后得到独立目录而非散落文件。
+          tar -czf "${ARCHIVE}" \
+            --transform "s|^\./|${PKG_NAME}/|" \
+            --exclude='./tests' \
+            --exclude='./phpunit.xml' \
+            --exclude='*.md' \
+            --exclude='./vendor' \
+            --exclude='./.git' \
+            --exclude='./.github' \
+            --exclude='./.trae' \
+            --exclude='./.vscode' \
+            --exclude='*.tar.gz' \
+            -C . .
+
+          echo "Produced archive: ${ARCHIVE}"
+          ls -lh "${ARCHIVE}"
+          echo "archive=${ARCHIVE}" >> "${GITHUB_ENV}"
+
+      - name: Create GitHub release and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.archive }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
