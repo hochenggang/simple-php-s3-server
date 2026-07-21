@@ -597,11 +597,13 @@ class Authenticator
             return;
         }
 
-        // Prefer Content-Length header; fall back to decoded body length so that
-        // aws-chunked / chunked transfers (which may omit a meaningful Content-Length)
-        // cannot bypass the per-key upload size limit.
+        // Use the larger of Content-Length header and actual decoded body size.
+        // Relying on the header alone allows a client to forge Content-Length: 0
+        // while streaming a large body. For methods without a body (GET/HEAD/DELETE)
+        // getBody() returns '' without touching php://input, so this stays cheap.
         $contentLength = $this->request->getHeader('Content-Length');
-        $actualSize = $contentLength !== null ? (int)$contentLength : strlen($this->request->getBody());
+        $headerSize = $contentLength !== null ? (int)$contentLength : 0;
+        $actualSize = max($headerSize, strlen($this->request->getBody()));
 
         if ($actualSize > $maxSize) {
             throw S3Exception::entityTooLarge($actualSize, $maxSize);

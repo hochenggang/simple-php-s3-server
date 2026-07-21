@@ -117,6 +117,23 @@ class BucketControllerTest extends TestCase
         $this->controller->deleteBucket($request, $response);
     }
 
+    public function testCreateBucketWithInvalidNameThrowsInvalidBucketName(): void
+    {
+        // Uppercase letters are rejected by PathResolver::validateBucketName.
+        // The controller must surface this as InvalidBucketName (400), not let
+        // the InvalidArgumentException bubble up as InvalidRequest.
+        $request = $this->createRequest('PUT', '/INVALID-BUCKET');
+        $response = new Response();
+
+        try {
+            $this->controller->createBucket($request, $response);
+            $this->fail('Expected InvalidBucketName exception');
+        } catch (\S3Gateway\Exception\S3Exception $e) {
+            $this->assertEquals('InvalidBucketName', $e->getS3Code());
+            $this->assertEquals(400, $e->getHttpStatus());
+        }
+    }
+
     // ─── List Objects V1 ─────────────────────────────────────────────
 
     public function testListObjectsV1(): void

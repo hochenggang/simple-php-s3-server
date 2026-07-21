@@ -183,5 +183,15 @@ class BucketController
         if (empty($bucket)) {
             throw S3Exception::invalidBucketName();
         }
+
+        // Delegate name-format validation to PathResolver. Illegal names must
+        // surface as InvalidBucketName (400) — without this catch they leak up
+        // as InvalidArgumentException and get coerced by Router into the less
+        // specific InvalidRequest S3 code.
+        try {
+            $this->storage->getPathResolver()->validateBucketName($bucket);
+        } catch (\InvalidArgumentException $e) {
+            throw S3Exception::invalidBucketName();
+        }
     }
 }

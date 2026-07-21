@@ -2,6 +2,7 @@
 
 namespace S3Gateway\S3;
 
+use S3Gateway\Config;
 use S3Gateway\Exception\S3Exception;
 use S3Gateway\Http\Request;
 use S3Gateway\Http\Response;

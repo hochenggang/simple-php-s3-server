@@ -174,4 +174,38 @@ class ObjectControllerTest extends TestCase
             $this->assertEquals('InvalidRequest', $e->getS3Code());
         }
     }
+
+    public function testDeleteObjectsOnMissingBucketThrowsNoSuchBucket(): void
+    {
+        $xml = '<Delete><Object><Key>file.txt</Key></Object></Delete>';
+        $request = $this->createRequest('POST', '/missing-bucket', 'delete');
+        $bodyRef = new \ReflectionProperty(Request::class, 'body');
+        $bodyRef->setValue($request, $xml);
+
+        try {
+            $this->controller->deleteObjects($request, new Response());
+            $this->fail('Expected NoSuchBucket exception');
+        } catch (S3Exception $e) {
+            $this->assertEquals('NoSuchBucket', $e->getS3Code());
+            $this->assertEquals(404, $e->getHttpStatus());
+        }
+    }
+
+    public function testCopyObjectFromMissingBucketThrowsNoSuchBucket(): void
+    {
+        $this->storage->createBucket('dest-bucket');
+
+        // Headers are parsed from $_SERVER['HTTP_*'] in Request::parseHeaders.
+        $_SERVER['HTTP_X_AMZ_COPY_SOURCE'] = '/missing-source-bucket/source.txt';
+        try {
+            $request = $this->createRequest('PUT', '/dest-bucket/dest.txt');
+            $this->controller->putObject($request, new Response());
+            $this->fail('Expected NoSuchBucket exception');
+        } catch (S3Exception $e) {
+            $this->assertEquals('NoSuchBucket', $e->getS3Code());
+            $this->assertEquals(404, $e->getHttpStatus());
+        } finally {
+            unset($_SERVER['HTTP_X_AMZ_COPY_SOURCE']);
+        }
+    }
 }

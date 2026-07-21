@@ -30,7 +30,7 @@ set_exception_handler(function($e) {
     http_response_code(500);
     header('Content-Type: application/xml');
     echo '<?xml version="1.0" encoding="UTF-8"?>';
-    echo '<Error><Code>InternalError</Code><Message>' . $e->getMessage() . '</Message></Error>';
+    echo '<Error><Code>InternalError</Code><Message>Internal server error</Message></Error>';
 });
 
 use S3Gateway\Http\Router;
@@ -40,9 +40,9 @@ try {
     $router->handle();
 } catch (Throwable $e) {
     S3Gateway\Logger::exception($e, 'Unhandled Throwable');
-    
+
     http_response_code(500);
     header('Content-Type: application/xml');
     echo '<?xml version="1.0" encoding="UTF-8"?>';
-    echo '<Error><Code>InternalError</Code><Message>' . $e->getMessage() . '</Message></Error>';
+    echo '<Error><Code>InternalError</Code><Message>Internal server error</Message></Error>';
 }

@@ -17,36 +17,70 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+          extensions: mbstring, xml, fileinfo
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-interaction
+
+      - name: Run tests
+        # 测试结果通过 tee 同时输出到 step 日志和文件，供 release body 引用。
+        # bash -o pipefail 保证 phpunit 失败时整个 step 失败，不会创建 release。
+        run: vendor/bin/phpunit --no-coverage 2>&1 | tee /tmp/test-output.log
+
       - name: Build source archive
         run: |
           PKG_NAME="${{ github.event.repository.name }}-${{ github.ref_name }}"
-          ARCHIVE="${PKG_NAME}.tar.gz"
+          ARCHIVE="/tmp/${PKG_NAME}.tar.gz"
 
-          # 打包当前目录，按需排除：
-          #   - 用户指定：tests / phpunit.xml / *.md
-          #   - 显而易见的开发工件：vendor / .git / .github / .trae / .vscode
-          #   - 压缩包产物自身：*.tar.gz
-          # --transform 给所有路径加上顶级目录前缀，解压后得到独立目录而非散落文件。
-          tar -czf "${ARCHIVE}" \
-            --transform "s|^\./|${PKG_NAME}/|" \
-            --exclude='./tests' \
-            --exclude='./phpunit.xml' \
-            --exclude='*.md' \
-            --exclude='./vendor' \
-            --exclude='./.git' \
-            --exclude='./.github' \
-            --exclude='./.trae' \
-            --exclude='./.vscode' \
-            --exclude='*.tar.gz' \
-            -C . .
+          # 用 git ls-files 生成确定性文件列表，避免直接打包工作目录。
+          # 旧版 tar -C . . 会因 archive 写入当前目录导致 "." 的 mtime
+          # 在读取过程中变化，触发 "file changed as we read it" 退出码 1。
+          # 这里 archive 输出到 /tmp，工作目录在打包期间保持只读，
+          # 根治该问题。
+          # 排除：tests/、phpunit.xml、*.md、.github/（开发工件与文档）。
+          git ls-files \
+            | grep -v '^tests/' \
+            | grep -v '^phpunit\.xml$' \
+            | grep -v '\.md$' \
+            | grep -v '^\.github/' \
+            > /tmp/keep.txt
+
+          # --transform 给每个路径加 PKG_NAME/ 前缀，解压后得到独立顶级目录。
+          tar -czf "${ARCHIVE}" -T /tmp/keep.txt \
+            --transform "s|^|${PKG_NAME}/|"
 
           echo "Produced archive: ${ARCHIVE}"
           ls -lh "${ARCHIVE}"
           echo "archive=${ARCHIVE}" >> "${GITHUB_ENV}"
 
+      - name: Build release body
+        # 拼接测试结果与 GitHub 自动生成的 release notes。
+        # 不直接用 generate_release_notes: true，因为它会覆盖 body_path。
+        run: |
+          {
+            echo "## Test Results"
+            echo ""
+            echo '```'
+            cat /tmp/test-output.log
+            echo '```'
+            echo ""
+            echo "## Changes"
+            echo ""
+            gh api "repos/${{ github.repository }}/releases/generate-notes" \
+              -f tag_name="${{ github.ref_name }}" \
+              --jq '.body' 2>/dev/null || true
+          } > /tmp/release-body.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create GitHub release and upload asset
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.archive }}
-          generate_release_notes: true
+          body_path: /tmp/release-body.md
           fail_on_unmatched_files: true

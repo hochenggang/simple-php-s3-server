@@ -74,6 +74,12 @@ class ObjectController
             [$sourceKey, ] = explode('?versionId=', $sourceKey, 2);
         }
 
+        // Surface a missing source bucket as NoSuchBucket (not NoSuchKey) so
+        // clients get the correct diagnosis when the bucket itself is gone.
+        if (!$this->storage->bucketExists($sourceBucket)) {
+            throw S3Exception::noSuchBucket('/' . $sourceBucket);
+        }
+
         $sourcePath = $this->storage->getPathResolver()->objectPath($sourceBucket, $sourceKey);
         $destPath = $this->storage->getPathResolver()->objectPath($destBucket, $destKey);
 
@@ -263,6 +269,10 @@ class ObjectController
 
         if (empty($bucket)) {
             throw S3Exception::invalidBucketName();
+        }
+
+        if (!$this->storage->bucketExists($bucket)) {
+            throw S3Exception::noSuchBucket('/' . $bucket);
         }
 
         $input = $request->getBody();

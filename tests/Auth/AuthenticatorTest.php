@@ -156,4 +156,45 @@ class AuthenticatorTest extends TestCase
         $auth->checkRequestSize('');
         $this->assertTrue(true); // No exception means pass
     }
+
+    /**
+     * Regression: a client could forge Content-Length: 0 to bypass per-key
+     * upload limits while streaming a large body. checkRequestSize must use
+     * the larger of the header and the actual decoded body length.
+     */
+    public function testCheckRequestSizeRejectsForgedContentLengthZero(): void
+    {
+        $this->resetConfig($this->testDir);
+
+        // Inject an access key with a 100-byte upload cap.
+        $ref = new \ReflectionClass(\S3Gateway\Config::class);
+        $keysProp = $ref->getProperty('accessKeys');
+        $keysProp->setValue(null, [
+            'size-key' => [
+                'secret_key' => 'secret',
+                'allowed_buckets' => ['*'],
+                'file_max_size' => 100,
+            ],
+        ]);
+
+        $request = $this->createRequest([
+            'REQUEST_METHOD' => 'PUT',
+            'REQUEST_URI' => '/bucket/key',
+            'CONTENT_LENGTH' => '0', // forged
+        ]);
+
+        // Simulate a 200-byte body that the client actually sent.
+        $bodyRef = new \ReflectionProperty(Request::class, 'body');
+        $bodyRef->setValue($request, str_repeat('x', 200));
+
+        $auth = new Authenticator($request);
+
+        try {
+            $auth->checkRequestSize('size-key');
+            $this->fail('Expected EntityTooLarge exception');
+        } catch (S3Exception $e) {
+            $this->assertEquals('EntityTooLarge', $e->getS3Code());
+            $this->assertEquals(400, $e->getHttpStatus());
+        }
+    }
 }
