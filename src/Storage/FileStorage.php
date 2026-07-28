@@ -4,6 +4,8 @@ namespace S3Gateway\Storage;
 
 use S3Gateway\Config;
 use S3Gateway\Exception\S3Exception;
+use S3Gateway\Logger;
+use Symfony\Component\Filesystem\Path;
 
 class FileStorage
 {
@@ -72,7 +74,18 @@ class FileStorage
         string $startAfter = '',
         string $marker = ''
     ): array {
-        $allFiles = $this->scanFilesystem($bucket, $prefix);
+        $allFiles = $this->getScanCache($bucket);
+        if ($allFiles === null) {
+            $allFiles = $this->scanFilesystem($bucket);
+            $this->setScanCache($bucket, $allFiles);
+        }
+
+        // prefix 过滤在内存中执行（缓存的是完整扫描结果）
+        $decodedPrefix = $prefix ? rawurldecode(str_replace('+', ' ', $prefix)) : '';
+        if ($decodedPrefix !== '') {
+            $allFiles = array_filter($allFiles, fn($f) => str_starts_with($f['key'], $decodedPrefix));
+            $allFiles = array_values($allFiles);
+        }
 
         usort($allFiles, fn($a, $b) => strcmp($a['key'], $b['key']));
 
@@ -144,7 +157,7 @@ class FileStorage
         ];
     }
 
-    private function scanFilesystem(string $bucket, string $prefix = ''): array
+    private function scanFilesystem(string $bucket): array
     {
         $bucketPath = $this->pathResolver->bucketPath($bucket);
 
@@ -152,7 +165,6 @@ class FileStorage
             return [];
         }
 
-        $decodedPrefix = $prefix ? rawurldecode(str_replace('+', ' ', $prefix)) : '';
         $files = [];
 
         $iterator = new \RecursiveIteratorIterator(
@@ -170,10 +182,6 @@ class FileStorage
             if ($fileInfo->isFile()) {
                 $relativePath = $this->pathResolver->getRelativePath($bucketPath, $path);
 
-                if ($decodedPrefix && !str_starts_with($relativePath, $decodedPrefix)) {
-                    continue;
-                }
-
                 $s3Key = $this->encodeKey($relativePath);
                 clearstatcache(true, $path);
                 $size = $fileInfo->getSize();
@@ -188,6 +196,75 @@ class FileStorage
         }
 
         return $files;
+    }
+
+    /**
+     * ListObjects 结果缓存：缓存完整扫描结果，分页请求复用同一份缓存。
+     * 格式 JSON 数组，每元素 [key, size, mtime, etag] 四元组（紧凑）。
+     * TTL 由 LIST_BUCKETS_CACHE_TIMEOUT 配置（默认 60 秒），按文件 mtime 判断。
+     */
+    private function getScanCache(string $bucket): ?array
+    {
+        $cacheFile = $this->scanCachePath($bucket);
+        if (!file_exists($cacheFile)) {
+            return null;
+        }
+
+        $ttl = Config::listBucketsCacheTimeout();
+        if ($ttl <= 0) {
+            return null;
+        }
+        if ((time() - filemtime($cacheFile)) > $ttl) {
+            return null;
+        }
+
+        $data = json_decode((string)file_get_contents($cacheFile), true);
+        if (!is_array($data)) {
+            return null;
+        }
+
+        $files = [];
+        foreach ($data as $row) {
+            $files[] = [
+                'key' => $row[0],
+                'size' => $row[1],
+                'timestamp' => $row[2],
+                'etag' => $row[3],
+            ];
+        }
+        return $files;
+    }
+
+    private function setScanCache(string $bucket, array $files): void
+    {
+        if (Config::listBucketsCacheTimeout() <= 0) {
+            return;
+        }
+        $cacheFile = $this->scanCachePath($bucket);
+        $dir = dirname($cacheFile);
+        if (!is_dir($dir)) {
+            @mkdir($dir, 0755, true);
+            if (!is_dir($dir)) {
+                return;
+            }
+        }
+
+        $rows = [];
+        foreach ($files as $f) {
+            $rows[] = [$f['key'], $f['size'], $f['timestamp'], $f['etag']];
+        }
+
+        // 原子写入：先写 .tmp 再 rename
+        $tmp = $cacheFile . '.tmp';
+        if (file_put_contents($tmp, json_encode($rows)) === false) {
+            return;
+        }
+        @rename($tmp, $cacheFile);
+    }
+
+    private function scanCachePath(string $bucket): string
+    {
+        return Path::join(dirname(__DIR__, 2), 'tmp', 'listbuckets', $bucket . '.json');
     }
 
     /**
@@ -471,9 +548,9 @@ class FileStorage
                 return null;
             }
 
-            if (Config::getMaxUploadSize() > 0 && $finalSize > Config::getMaxUploadSize()) {
+            if (Config::maxUploadSize() > 0 && $finalSize > Config::maxUploadSize()) {
                 @unlink($tempPath);
-                throw S3Exception::entityTooLarge($finalSize, Config::getMaxUploadSize());
+                throw S3Exception::entityTooLarge($finalSize, Config::maxUploadSize());
             }
 
             if (!@rename($tempPath, $filePath)) {
@@ -496,7 +573,7 @@ class FileStorage
         } catch (\Exception $e) {
             fclose($fp);
             @unlink($tempPath);
-            error_log('FileStorage::completeMultipartUpload error: ' . $e->getMessage());
+            Logger::error('FileStorage::completeMultipartUpload error: ' . $e->getMessage());
             return null;
         }
     }

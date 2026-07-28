@@ -37,7 +37,7 @@ class Router
     {
         try {
             if ($this->request->isPreflight()) {
-                $this->response->sendEmpty(200);
+                $this->sendCorsPreflight();
                 return;
             }
 
@@ -57,6 +57,16 @@ class Router
             Logger::exception($e, 'Unexpected error');
             $this->handleException(S3Exception::internalError('Internal server error'));
         }
+    }
+
+    private function sendCorsPreflight(): void
+    {
+        $this->response
+            ->setHeader('Access-Control-Allow-Origin', '*')
+            ->setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, HEAD')
+            ->setHeader('Access-Control-Allow-Headers', '*')
+            ->setHeader('Access-Control-Max-Age', '86400')
+            ->sendEmpty(200);
     }
 
     private function handleException(S3Exception $e): void
@@ -121,7 +131,7 @@ class Router
                 break;
 
             case 'OPTIONS':
-                $this->response->sendEmpty(200);
+                $this->sendCorsPreflight();
                 break;
 
             default:

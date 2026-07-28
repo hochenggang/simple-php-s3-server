@@ -2,7 +2,7 @@
 
 ## Core Objective
 
-Implement a pure local filesystem-based S3-compatible API gateway using PHP.
+Implement a pure local filesystem-based S3-compatible API gateway using PHP. Focus on core S3 operations.
 
 ## Supported Operations
 
@@ -31,9 +31,11 @@ Implement a pure local filesystem-based S3-compatible API gateway using PHP.
 
 ## Design Principles
 
-**Keep it minimal.** Advanced features such as ACL, versioning, and other non-essential functionalities are explicitly excluded.
+**Keep it minimal.** Advanced features such as ACL, versioning, and other non-essential functionalities are explicitly excluded. Focus on core S3 operations.
 
-Full suport for S3V4 Sign Authorization for headers.**authorization.**
+
+**Authorization.**
+Full suport for S3V4 Sign Authorization for headers.
 
 Particial surport for of presign url authorization of GET object requests.
 

@@ -13,6 +13,13 @@ define('ERROR_LOG_FILE', __DIR__ . '/error_log');
 
 require_once __DIR__ . '/vendor/autoload.php';
 
+// 迁移旧版 .config.ini 到 ../config.ini（设计 v2：配置外迁至项目上级目录）
+$legacyConfig = __DIR__ . '/.config.ini';
+$newConfig = dirname(__DIR__) . '/config.ini';
+if (file_exists($legacyConfig) && !file_exists($newConfig)) {
+    @rename($legacyConfig, $newConfig);
+}
+
 // All timestamps (logs, XML CreationDate/LastModified, HTTP Last-Modified) use UTC
 // to match the "Z" suffix emitted by XmlResponse and the RFC 7232 HTTP-date spec.
 date_default_timezone_set('UTC');

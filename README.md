@@ -9,10 +9,16 @@ A lightweight S3-compatible object storage server implemented in PHP, using loca
 
 - S3 Object API compatibility (PUT/GET/DELETE/HEAD)
 - Multipart upload support (create/UploadPart/complete/abort)
-- AWS Signature V4 authentication
+- AWS Signature V4 authentication (SigV2 / Bearer Token deprecated)
 - Pure filesystem storage (no database required)
-- Per-key upload size limits (KB)
+- Per-key upload size limits (integer KB)
 - Per-key bucket access control
+- ListObjects result caching for large buckets
+- CORS preflight support
+
+## Design Document
+
+See [design-v2.en.md](./design-v2.en.md) for the full design specification.
 
 ## Quick Start
 
@@ -22,10 +28,11 @@ Upload all files to your website root directory.
 
 2. **Configure**
 
-Edit `.config.ini` file:
+Create `../config.ini` (parent directory of the project, set permission `600`). If a legacy `.config.ini` exists in the project root, it is automatically migrated on first run:
 ```ini
-; Access Keys configuration
-; Format: [keys.{access_key_id}]
+[general]
+DATA_DIR=../data
+APP_DEBUG=false
 
 [keys.key1]
 secret_key=your-secret-key1
@@ -65,12 +72,20 @@ s3.download_file('bucket', 'remote.txt', 'local.txt')
 
 ## Configuration
 
-The configuration is stored in `.config.ini` file with INI format:
+The configuration is stored in `../config.ini` (INI format), located in the parent directory of the project to avoid web exposure. Set file permission `600`.
+
+**General (`[general]`)**
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DATA_DIR` | Data storage directory | `../data` |
 | `APP_DEBUG` | Application debug mode | `false` |
+| `MAX_KEYS` | Max objects returned per listing | `100000` |
+| `MAX_TIMESTAMP_SKEW` | Max auth timestamp skew (seconds) | `300` |
+| `MAX_UPLOAD_SIZE` | Single-request/part size limit (KB) | `8192` (8MB) |
+| `MULTIPART_UPLOAD_TTL` | Multipart residual timeout (seconds) | `86400` |
+| `LIST_BUCKETS_CACHE_TIMEOUT` | ListObjects cache TTL (seconds) | `60` |
+| `TRUST_PROXY_HEADERS` | Trust X-Forwarded-* headers | `false` |
 
 Do not put `DATA_DIR` in the same directory as the gateway files. It is recommended to put it in a parent directory to avoid exposing the storage directory.
 
@@ -100,6 +115,14 @@ file_max_size=10240
 ## Storage
 
 Objects are stored at: `../data/{bucket}/{key}`
+
+## Maintenance
+
+Run `php cleanup_multipart.php` periodically (e.g. via crontab) to clean up abandoned multipart upload remnants:
+
+```
+0 3 * * * /usr/bin/php /path/to/simple-php-s3-server/cleanup_multipart.php
+```
 
 ## Known Limitations
 

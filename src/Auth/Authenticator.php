@@ -13,14 +13,10 @@ use S3Gateway\Logger;
  * Supports:
  * - AWS4-HMAC-SHA256 Authorization Header
  * - Presigned URL (X-Amz-Credential query param)
- * - AWS Signature V2 (legacy)
- * - Bearer Token
  */
 class Authenticator
 {
     private Request $request;
-
-    private const MAX_TIMESTAMP_SKEW = 300;
 
     private const HOP_BY_HOP_HEADERS = [
         'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -53,11 +49,6 @@ class Authenticator
         $accessKeyId = null;
         if (str_starts_with($authHeader, 'AWS4-HMAC-SHA256')) {
             $accessKeyId = $this->authenticateAwsSignatureV4($authHeader);
-        } elseif (str_starts_with($authHeader, 'AWS ')) {
-            $accessKeyId = $this->authenticateAwsSignatureV2($authHeader);
-        } elseif (str_starts_with($authHeader, 'Bearer ')) {
-            $this->authenticateBearerToken($authHeader);
-            return '';
         } else {
             throw S3Exception::accessDenied();
         }
@@ -168,7 +159,7 @@ class Authenticator
         $now = new \DateTime('now', new \DateTimeZone('UTC'));
         $diff = abs($now->getTimestamp() - $requestTime->getTimestamp());
 
-        if ($diff > self::MAX_TIMESTAMP_SKEW) {
+        if ($diff > Config::maxTimestampSkew()) {
             throw S3Exception::expiredToken('Request timestamp skew too large');
         }
     }
@@ -413,8 +404,12 @@ class Authenticator
         $signature = $this->request->getQueryParam('X-Amz-Signature') ??
                      $this->request->getQueryParam('x-amz-signature');
 
-        if (empty($credential) || empty($algorithm) || empty($date) ||
-            empty($signedHeaders) || empty($signature) || empty($expires)) {
+        // Use === null instead of empty() so that X-Amz-Expires=0 is treated as
+        // "present but invalid" (handled by checkPresignedUrlExpiry) rather than
+        // "missing". empty('0') returns true in PHP, which would mask the real
+        // InvalidRequest error with a misleading AccessDenied.
+        if ($credential === null || $algorithm === null || $date === null ||
+            $signedHeaders === null || $signature === null || $expires === null) {
             throw S3Exception::accessDenied('Missing required presigned URL parameters');
         }
 
@@ -546,53 +541,16 @@ class Authenticator
         );
     }
 
-    // ─── AWS Signature Version 2 (legacy) ──────────────────────────────
-
-    private function authenticateAwsSignatureV2(string $authHeader): string
-    {
-        $pattern = '/AWS\s+([^:]+):(.+)/';
-        if (!preg_match($pattern, $authHeader, $matches)) {
-            throw S3Exception::accessDenied();
-        }
-
-        $accessKeyId = $matches[1];
-        $signature = $matches[2];
-
-        $secretKey = Config::getSecretKey($accessKeyId);
-        if ($secretKey === null) {
-            throw S3Exception::invalidAccessKeyId();
-        }
-
-        $stringToSign = $this->request->getMethod() . "\n\n\n" .
-                        $this->request->getHeader('Date') . "\n" .
-                        $this->request->getUri();
-
-        $expectedSignature = base64_encode(hash_hmac('sha1', $stringToSign, $secretKey, true));
-
-        if (!hash_equals($expectedSignature, $signature)) {
-            throw S3Exception::signatureDoesNotMatch();
-        }
-
-        return $accessKeyId;
-    }
-
-    // ─── Bearer Token ──────────────────────────────────────────────────
-
-    private function authenticateBearerToken(string $authHeader): void
-    {
-        $token = substr($authHeader, 7);
-        $validToken = Config::bearerToken();
-
-        if ($validToken === null || !hash_equals($validToken, $token)) {
-            throw S3Exception::accessDenied();
-        }
-    }
-
     // ─── Request size check ────────────────────────────────────────────
 
     public function checkRequestSize(string $accessKeyId): void
     {
+        // Per-key quota first; fall back to global MAX_UPLOAD_SIZE when unset,
+        // so a forged Content-Length: 0 cannot bypass the early header check.
         $maxSize = Config::getFileMaxSize($accessKeyId);
+        if ($maxSize <= 0) {
+            $maxSize = Config::maxUploadSize();
+        }
         if ($maxSize <= 0) {
             return;
         }
@@ -612,8 +570,8 @@ class Authenticator
 
     /**
      * 早期请求大小检查：基于 Content-Length 头，在认证前拒绝超大请求。
-     * 全局上限 = 所有 access key 中最大的 file_max_size。
-     * 若所有 key 均无限制（返回 0），跳过，回退到认证后的 per-key checkRequestSize()。
+     * 全局上限 = MAX_UPLOAD_SIZE 配置（默认 8MB）。
+     * 若配置为 0（不限制），跳过，回退到认证后的 per-key checkRequestSize()。
      */
     public function checkEarlyRequestSize(): void
     {
@@ -621,7 +579,7 @@ class Authenticator
         if ($contentLength === null) {
             return;
         }
-        $globalMax = Config::getMaxUploadSize();
+        $globalMax = Config::maxUploadSize();
         if ($globalMax > 0 && (int)$contentLength > $globalMax) {
             throw S3Exception::entityTooLarge((int)$contentLength, $globalMax);
         }

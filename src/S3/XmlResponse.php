@@ -21,12 +21,15 @@ class XmlResponse
 
     public static function error(string $code, string $message, string $resource = ''): string
     {
+        // 注意：Error 元素不加 xmlns。AWS S3 的错误响应本身不携带 xmlns，
+        // 而 boto3/botocore 的 ElementTree 解析器在存在默认命名空间时
+        // 无法通过 find('Code') 定位到元素，导致错误码丢失为空字符串。
         return ArrayToXml::convert([
             'Code' => $code,
             'Message' => $message,
             'Resource' => $resource,
             'RequestId' => bin2hex(random_bytes(8)),
-        ], self::rootElement('Error'), false);
+        ], 'Error', false);
     }
 
     public static function listBuckets(array $buckets, string $dataDir): string

@@ -18,7 +18,7 @@ class Config
         self::$config = [];
         self::$accessKeys = [];
 
-        $iniFile = Path::join(dirname(__DIR__), '.config.ini');
+        $iniFile = Path::join(dirname(__DIR__, 2), 'config.ini');
         if (file_exists($iniFile)) {
             $iniContent = parse_ini_file($iniFile, true);
             if ($iniContent !== false) {
@@ -47,8 +47,8 @@ class Config
                         }
 
                         if (isset($value['file_max_size'])) {
-                            // Support fractional KB values (e.g. 1.5 KB). ceil to bytes-conservative.
-                            $accessKey['file_max_size'] = (int)ceil((float)$value['file_max_size']) * 1024;
+                            // Integer KB only.
+                            $accessKey['file_max_size'] = (int)$value['file_max_size'] * 1024;
                         }
 
                         self::$accessKeys[$accessKeyId] = $accessKey;
@@ -89,6 +89,35 @@ class Config
         return self::get('APP_DEBUG', 'false') === 'true';
     }
 
+    public static function maxKeys(): int
+    {
+        return (int)self::get('MAX_KEYS', 100000);
+    }
+
+    public static function maxTimestampSkew(): int
+    {
+        return (int)self::get('MAX_TIMESTAMP_SKEW', 300);
+    }
+
+    /**
+     * Global per-request / per-part upload size limit in bytes.
+     * Reads MAX_UPLOAD_SIZE (unit KB, default 8192 = 8MB). 0 means no limit.
+     */
+    public static function maxUploadSize(): int
+    {
+        return (int)self::get('MAX_UPLOAD_SIZE', 8192) * 1024;
+    }
+
+    public static function multipartUploadTtl(): int
+    {
+        return (int)self::get('MULTIPART_UPLOAD_TTL', 86400);
+    }
+
+    public static function listBucketsCacheTimeout(): int
+    {
+        return (int)self::get('LIST_BUCKETS_CACHE_TIMEOUT', 60);
+    }
+
     public static function getSecretKey(string $accessKeyId): ?string
     {
         self::load();
@@ -123,28 +152,6 @@ class Config
         }
 
         return self::$accessKeys[$accessKeyId]['file_max_size'] ?? 0;
-    }
-
-    /**
-     * 所有 access key 中最大的 file_max_size，用于 Router 早期 Content-Length 拒绝。
-     * 返回 0 表示无限制（所有 key 均未设 file_max_size）。
-     */
-    public static function getMaxUploadSize(): int
-    {
-        self::load();
-        $max = 0;
-        foreach (self::$accessKeys as $accessKey) {
-            $size = $accessKey['file_max_size'] ?? 0;
-            if ($size > $max) {
-                $max = $size;
-            }
-        }
-        return $max;
-    }
-
-    public static function bearerToken(): ?string
-    {
-        return self::get('BEARER_TOKEN');
     }
 
     /**

@@ -21,6 +21,7 @@ class BucketControllerTest extends TestCase
     {
         $this->testDir = sys_get_temp_dir() . '/s3gateway_bucket_test_' . uniqid();
         $this->resetConfig($this->testDir);
+        $this->setConfigValue('LIST_BUCKETS_CACHE_TIMEOUT', '0');
         $this->storage = new FileStorage();
         $this->controller = new BucketController($this->storage);
     }
@@ -76,6 +77,28 @@ class BucketControllerTest extends TestCase
         }
         $this->assertContains('test-bucket-a', $bucketNames);
         $this->assertContains('test-bucket-b', $bucketNames);
+    }
+
+    public function testListObjectsMaxKeysLimitedByConfig(): void
+    {
+        $this->storage->createBucket('maxkeys-bucket');
+        for ($i = 0; $i < 5; $i++) {
+            $this->storage->putObjectFromString('maxkeys-bucket', "obj-{$i}", 'x');
+        }
+
+        $this->setConfigValue('MAX_KEYS', '3');
+
+        $request = $this->createRequest('GET', '/maxkeys-bucket', 'max-keys=10');
+        $response = new Response();
+
+        ob_start();
+        $this->controller->listObjects($request, $response);
+        $output = ob_get_clean();
+
+        $parsed = simplexml_load_string($output);
+        $this->assertNotFalse($parsed);
+        $this->assertEquals(3, count($parsed->Contents));
+        $this->assertEquals('true', (string)$parsed->IsTruncated);
     }
 
     // ─── Create Bucket ───────────────────────────────────────────────

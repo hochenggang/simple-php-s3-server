@@ -2,6 +2,7 @@
 
 namespace S3Gateway\S3;
 
+use S3Gateway\Config;
 use S3Gateway\Exception\S3Exception;
 use S3Gateway\Http\Request;
 use S3Gateway\Http\Response;
@@ -76,7 +77,7 @@ class BucketController
         }
 
         $prefix = $request->getQueryParam('prefix') ?? '';
-        $maxKeys = max(0, min(1000, (int)($request->getQueryParam('max-keys') ?? 1000)));
+        $maxKeys = max(0, min(Config::maxKeys(), (int)($request->getQueryParam('max-keys') ?? 1000)));
         $marker = $request->getQueryParam('marker') ?? '';
         $delimiter = $request->getQueryParam('delimiter') ?? '';
         $encodingType = $request->getQueryParam('encoding-type') ?? '';
@@ -114,7 +115,7 @@ class BucketController
         }
 
         $prefix = $request->getQueryParam('prefix') ?? '';
-        $maxKeys = max(0, min(1000, (int)($request->getQueryParam('max-keys') ?? 1000)));
+        $maxKeys = max(0, min(Config::maxKeys(), (int)($request->getQueryParam('max-keys') ?? 1000)));
         $continuationToken = $request->getQueryParam('continuation-token') ?? '';
         $startAfter = $request->getQueryParam('start-after') ?? '';
         $fetchOwner = strtolower($request->getQueryParam('fetch-owner') ?? '') === 'true';

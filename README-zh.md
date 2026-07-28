@@ -9,10 +9,16 @@
 
 - S3 对象 API 兼容（PUT/GET/DELETE/HEAD）
 - 分片上传支持（create/UploadPart/complete/abort）
-- AWS Signature V4 签名认证
+- AWS Signature V4 签名认证（已弃用 SigV2 / Bearer Token）
 - 纯文件系统存储（无需数据库）
-- 支持按密钥限制上传大小（KB）
+- 支持按密钥限制上传大小（整数 KB）
 - 支持按密钥限制存储桶访问
+- ListObjects 结果缓存，优化大桶性能
+- CORS 跨域预检支持
+
+## 设计文档
+
+完整设计规范见 [design-v2.md](./design-v2.md)。
 
 
 ## 快速开始
@@ -23,10 +29,11 @@
 
 2. **配置**
 
-编辑 `.config.ini` 文件：
+创建 `../config.ini`（项目上级目录，权限设为 `600`）。若项目根存在旧版 `.config.ini`，首次运行时自动迁移：
 ```ini
-; Access Keys configuration
-; Format: [keys.{access_key_id}]
+[general]
+DATA_DIR=../data
+APP_DEBUG=false
 
 [keys.key1]
 secret_key=your-secret-key1
@@ -66,12 +73,20 @@ s3.download_file('bucket', 'remote.txt', 'local.txt')
 
 ## 配置
 
-配置存储在 `.config.ini` 文件中，使用 INI 格式：
+配置存储在 `../config.ini`（INI 格式，位于项目上级目录，避免 Web 暴露），文件权限设为 `600`。
+
+**通用配置（`[general]`）**
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `DATA_DIR` | 数据存储目录 | `../data` |
 | `APP_DEBUG` | 应用调试模式 | `false` |
+| `MAX_KEYS` | 单次列举最大返回对象数 | `100000` |
+| `MAX_TIMESTAMP_SKEW` | 认证时间偏移最大秒数 | `300` |
+| `MAX_UPLOAD_SIZE` | 单次请求 body 与单分片大小上限（KB） | `8192`（8MB） |
+| `MULTIPART_UPLOAD_TTL` | 分片上传残留超时秒数，超时由清理脚本删除 | `86400` |
+| `LIST_BUCKETS_CACHE_TIMEOUT` | ListObjects 结果缓存有效期（秒） | `60` |
+| `TRUST_PROXY_HEADERS` | 是否信任 X-Forwarded-* 头（反向代理后开启） | `false` |
 
 **注意**：`DATA_DIR` 目录**不能**与网关文件在同一目录下。建议将其放在父目录下，避免暴露存储目录。
 
@@ -101,6 +116,14 @@ file_max_size=10240
 ## 存储
 
 对象存储在：`../data/{bucket}/{key}`
+
+## 维护
+
+定期运行 `php cleanup_multipart.php`（如通过 crontab）清理放弃的分片上传残留：
+
+```
+0 3 * * * /usr/bin/php /path/to/simple-php-s3-server/cleanup_multipart.php
+```
 
 ## 已知限制
 

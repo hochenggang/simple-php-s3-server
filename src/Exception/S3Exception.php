@@ -29,9 +29,9 @@ class S3Exception extends \Exception
         return $this->code;
     }
 
-    public static function accessDenied(): self
+    public static function accessDenied(string $message = 'Access Denied'): self
     {
-        return new self('AccessDenied', 'Access Denied', 401);
+        return new self('AccessDenied', $message, 401);
     }
 
     public static function invalidAccessKeyId(): self
