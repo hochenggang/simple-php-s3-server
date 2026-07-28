@@ -115,7 +115,7 @@ file_max_size=10240
 
 ## 存储
 
-对象存储在：`../data/{bucket}/{key}`
+对象存储在：`DATA_DIR/{bucket}/{key}`
 
 ## 维护
 
