@@ -43,6 +43,10 @@ class Authenticator
         }
 
         if (empty($authHeader)) {
+            if ($this->allowsAnonymousPublicRead()) {
+                return '';
+            }
+
             throw S3Exception::accessDenied();
         }
 
@@ -66,6 +70,23 @@ class Authenticator
         if ($bucketName !== '' && !Config::isBucketAllowed($accessKeyId, $bucketName)) {
             throw S3Exception::accessDenied("Access denied for bucket: {$bucketName}");
         }
+    }
+
+    private function allowsAnonymousPublicRead(): bool
+    {
+        $method = $this->request->getMethod();
+        if ($method !== 'GET' && $method !== 'HEAD') {
+            return false;
+        }
+
+        if ($this->request->hasQueryParam('uploadId')) {
+            return false;
+        }
+
+        $bucket = $this->request->getBucket();
+        $key = $this->request->getKey();
+
+        return $bucket !== '' && $key !== '' && Config::isPublicBucket($bucket);
     }
 
     private function isPresignedUrlRequest(): bool
