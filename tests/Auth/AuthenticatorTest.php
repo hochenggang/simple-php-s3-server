@@ -72,6 +72,70 @@ class AuthenticatorTest extends TestCase
         $auth->authenticate();
     }
 
+    public function testAnonymousGetAllowedForPublicBucketObject(): void
+    {
+        $this->setConfigValue('PUBLIC_BUCKETS', 'cloud');
+        $request = $this->createRequest([
+            'REQUEST_METHOD' => 'GET',
+            'REQUEST_URI' => '/cloud/photo.jpg',
+        ]);
+        $auth = new Authenticator($request);
+
+        $this->assertSame('', $auth->authenticate());
+    }
+
+    public function testAnonymousHeadAllowedForPublicBucketObject(): void
+    {
+        $this->setConfigValue('PUBLIC_BUCKETS', 'cloud');
+        $request = $this->createRequest([
+            'REQUEST_METHOD' => 'HEAD',
+            'REQUEST_URI' => '/cloud/photo.jpg',
+        ]);
+        $auth = new Authenticator($request);
+
+        $this->assertSame('', $auth->authenticate());
+    }
+
+    public function testAnonymousGetDeniedForPrivateBucketObject(): void
+    {
+        $this->setConfigValue('PUBLIC_BUCKETS', 'cloud');
+        $request = $this->createRequest([
+            'REQUEST_METHOD' => 'GET',
+            'REQUEST_URI' => '/private/photo.jpg',
+        ]);
+        $auth = new Authenticator($request);
+
+        $this->expectException(S3Exception::class);
+        $auth->authenticate();
+    }
+
+    public function testAnonymousGetDeniedForPublicBucketListing(): void
+    {
+        $this->setConfigValue('PUBLIC_BUCKETS', 'cloud');
+        $request = $this->createRequest([
+            'REQUEST_METHOD' => 'GET',
+            'REQUEST_URI' => '/cloud',
+        ]);
+        $auth = new Authenticator($request);
+
+        $this->expectException(S3Exception::class);
+        $auth->authenticate();
+    }
+
+    public function testAnonymousGetDeniedForPublicBucketMultipartListParts(): void
+    {
+        $this->setConfigValue('PUBLIC_BUCKETS', 'cloud');
+        $request = $this->createRequest([
+            'REQUEST_METHOD' => 'GET',
+            'REQUEST_URI' => '/cloud/photo.jpg?uploadId=upload-123',
+            'QUERY_STRING' => 'uploadId=upload-123',
+        ]);
+        $auth = new Authenticator($request);
+
+        $this->expectException(S3Exception::class);
+        $auth->authenticate();
+    }
+
     // ─── Invalid Authorization Format ────────────────────────────────
 
     public function testInvalidAuthFormat(): void

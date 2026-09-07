@@ -157,6 +157,31 @@ class ConfigTest extends TestCase
         $this->assertFalse(Config::trustProxyHeaders());
     }
 
+    public function testIsPublicBucketFalseByDefault(): void
+    {
+        $this->resetConfig($this->testDir);
+        $this->assertFalse(Config::isPublicBucket('cloud'));
+    }
+
+    public function testIsPublicBucketAllowsConfiguredBucket(): void
+    {
+        $this->resetConfig($this->testDir);
+        $this->setConfigValue('PUBLIC_BUCKETS', 'cloud, assets');
+
+        $this->assertTrue(Config::isPublicBucket('cloud'));
+        $this->assertTrue(Config::isPublicBucket('assets'));
+        $this->assertFalse(Config::isPublicBucket('private'));
+    }
+
+    public function testIsPublicBucketWildcardAllowsAnyBucket(): void
+    {
+        $this->resetConfig($this->testDir);
+        $this->setConfigValue('PUBLIC_BUCKETS', '*');
+
+        $this->assertTrue(Config::isPublicBucket('cloud'));
+        $this->assertTrue(Config::isPublicBucket('private'));
+    }
+
     public function testMaxTimestampSkewConfigured(): void
     {
         $this->resetConfig($this->testDir);

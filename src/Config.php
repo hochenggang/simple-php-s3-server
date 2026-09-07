@@ -144,6 +144,18 @@ class Config
         return in_array($bucketName, $allowedBuckets, true);
     }
 
+    public static function isPublicBucket(string $bucketName): bool
+    {
+        $publicBuckets = array_map('trim', explode(',', (string)self::get('PUBLIC_BUCKETS', '')));
+        $publicBuckets = array_filter($publicBuckets, fn(string $bucket): bool => $bucket !== '');
+
+        if (in_array('*', $publicBuckets, true)) {
+            return true;
+        }
+
+        return in_array($bucketName, $publicBuckets, true);
+    }
+
     public static function getFileMaxSize(string $accessKeyId): int
     {
         self::load();

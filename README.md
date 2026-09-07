@@ -86,8 +86,26 @@ The configuration is stored in `../config.ini` (INI format), located in the pare
 | `MULTIPART_UPLOAD_TTL` | Multipart residual timeout (seconds) | `86400` |
 | `LIST_BUCKETS_CACHE_TIMEOUT` | ListObjects cache TTL (seconds) | `60` |
 | `TRUST_PROXY_HEADERS` | Trust X-Forwarded-* headers | `false` |
+| `PUBLIC_BUCKETS` | Comma-separated buckets allowing anonymous object `GET`/`HEAD`, or `*` for all | unset |
 
 Do not put `DATA_DIR` in the same directory as the gateway files. It is recommended to put it in a parent directory to avoid exposing the storage directory.
+
+To allow direct public browser URLs for objects in selected buckets, configure `PUBLIC_BUCKETS`:
+
+```ini
+[general]
+DATA_DIR=../data
+APP_DEBUG=false
+PUBLIC_BUCKETS=cloud
+```
+
+With the app mounted at `https://s3.example.com`, an object in bucket `cloud` with key `photo.jpg` is available at:
+
+```text
+https://s3.example.com/cloud/photo.jpg
+```
+
+Only object `GET` and `HEAD` requests are public. Bucket listings, uploads, deletes, and private buckets still require signed S3 authentication.
 
 ### Access Keys Configuration
 
