@@ -21,8 +21,7 @@ class XmlResponseTest extends TestCase
 
     public function testListBuckets(): void
     {
-        $tmpDir = sys_get_temp_dir();
-        $xml = XmlResponse::listBuckets(['bucket-a', 'bucket-b'], $tmpDir);
+        $xml = XmlResponse::listBuckets(['bucket-a', 'bucket-b'], ['bucket-a' => 1700000000, 'bucket-b' => 1700000001]);
 
         $parsed = simplexml_load_string($xml);
         $this->assertNotFalse($parsed);
@@ -31,6 +30,7 @@ class XmlResponseTest extends TestCase
         foreach ($parsed->Buckets->Bucket as $bucket) {
             $bucketNames[] = (string)$bucket->Name;
         }
+        $this->assertSame('2023-11-14T22:13:20.000Z', (string)$parsed->Buckets->Bucket[0]->CreationDate);
         $this->assertCount(2, $bucketNames);
         $this->assertContains('bucket-a', $bucketNames);
         $this->assertContains('bucket-b', $bucketNames);
@@ -38,7 +38,7 @@ class XmlResponseTest extends TestCase
 
     public function testListBucketsEmpty(): void
     {
-        $xml = XmlResponse::listBuckets([], sys_get_temp_dir());
+        $xml = XmlResponse::listBuckets([], []);
 
         $parsed = simplexml_load_string($xml);
         $this->assertNotFalse($parsed);

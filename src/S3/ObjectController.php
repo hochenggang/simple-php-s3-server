@@ -5,13 +5,13 @@ namespace S3Gateway\S3;
 use S3Gateway\Exception\S3Exception;
 use S3Gateway\Http\Request;
 use S3Gateway\Http\Response;
-use S3Gateway\Storage\FileStorage;
+use S3Gateway\Storage\Storage;
 
 class ObjectController
 {
-    private FileStorage $storage;
+    private Storage $storage;
 
-    public function __construct(FileStorage $storage)
+    public function __construct(Storage $storage)
     {
         $this->storage = $storage;
     }
@@ -36,20 +36,17 @@ class ObjectController
         $copySource = $request->getHeader('X-Amz-Copy-Source');
 
         if ($copySource) {
-            $this->handleCopyObject($copySource, $bucket, $key, $response);
+            $this->handleCopyObject($request, $copySource, $bucket, $key, $response);
             return;
         }
 
-        $body = $request->getBody();
-
-        if (!$this->storage->putObjectFromString($bucket, $key, $body)) {
-            throw S3Exception::internalError('Failed to write object file', "/{$bucket}/{$key}");
+        $metadata = MetadataHeaders::fromRequest($request);
+        $input = $request->getBodyStream();
+        $meta = $this->storage->putObjectFromStream($bucket, $key, $input, $metadata);
+        if ($meta === null) {
+            throw S3Exception::internalError('Failed to store object', "/{$bucket}/{$key}");
         }
-
-        $etag = $this->storage->getMetaReader()->calculateEtag(
-            $this->storage->getPathResolver()->canonicalizeKey($key),
-            strlen($body)
-        );
+        $etag = $meta['etag'];
 
         $response
             ->setHeader('ETag', '"' . $etag . '"')
@@ -57,7 +54,7 @@ class ObjectController
             ->sendEmpty(200);
     }
 
-    private function handleCopyObject(string $copySource, string $destBucket, string $destKey, Response $response): void
+    private function handleCopyObject(Request $request, string $copySource, string $destBucket, string $destKey, Response $response): void
     {
         $copySource = rawurldecode($copySource);
         $copySource = ltrim($copySource, '/');
@@ -80,14 +77,24 @@ class ObjectController
             throw S3Exception::noSuchBucket('/' . $sourceBucket);
         }
 
-        $sourcePath = $this->storage->getPathResolver()->objectPath($sourceBucket, $sourceKey);
-        $destPath = $this->storage->getPathResolver()->objectPath($destBucket, $destKey);
-
-        if (!file_exists($sourcePath)) {
+        if (!$this->storage->objectExists($sourceBucket, $sourceKey)) {
             throw S3Exception::noSuchKey($copySource);
         }
 
-        if (!$this->storage->copyObject($sourceBucket, $sourceKey, $destBucket, $destKey)) {
+        $directive = strtoupper($request->getHeader('X-Amz-Metadata-Directive') ?? 'COPY');
+        if ($directive !== 'COPY' && $directive !== 'REPLACE') {
+            throw S3Exception::invalidArgument('Unknown metadata directive.');
+        }
+        $replaceMetadata = $directive === 'REPLACE' ? MetadataHeaders::fromRequest($request) : null;
+
+        // As in S3, copying an object onto itself must change its metadata.
+        if ($replaceMetadata === null && $sourceBucket === $destBucket && $sourceKey === rawurldecode($destKey)) {
+            throw S3Exception::invalidRequest(
+                'This copy request is illegal because it is trying to copy an object to itself without changing the object\'s metadata.'
+            );
+        }
+
+        if (!$this->storage->copyObject($sourceBucket, $sourceKey, $destBucket, $destKey, $replaceMetadata)) {
             throw S3Exception::internalError('Failed to copy object', "/{$destBucket}/{$destKey}");
         }
 
@@ -96,10 +103,7 @@ class ObjectController
             throw S3Exception::internalError('Failed to read object metadata', "/{$destBucket}/{$destKey}");
         }
 
-        $etag = $this->storage->getMetaReader()->calculateEtag(
-            $this->storage->getPathResolver()->canonicalizeKey($destKey),
-            $meta['size']
-        );
+        $etag = $meta['etag'];
         $lastModified = $meta['mtime'];
 
         $xml = XmlResponse::copyObject('"' . $etag . '"', $lastModified);
@@ -121,13 +125,6 @@ class ObjectController
 
         if (!$this->storage->bucketExists($bucket)) {
             throw S3Exception::noSuchBucket('/' . $bucket);
-        }
-
-        $filePath = $this->storage->getPathResolver()->objectPath($bucket, $key);
-
-        // is_file covers both "not exists" and "is a directory" (key maps to a folder).
-        if (!is_file($filePath)) {
-            throw S3Exception::noSuchKey("/{$bucket}/{$key}");
         }
 
         $meta = $this->storage->getObjectMeta($bucket, $key);
@@ -156,12 +153,27 @@ class ObjectController
             $options['partial'] = true;
         }
 
-        $response->sendFile($filePath, $options);
+        MetadataHeaders::apply($response, $meta['metadata'] ?? []);
+
+        $start = $options['start'] ?? 0;
+        $length = isset($options['end']) ? $options['end'] - $start + 1 : $fileSize;
+        $stream = $this->storage->openObject($bucket, $key, $start, $length);
+        if (!is_resource($stream)) {
+            throw S3Exception::noSuchKey("/{$bucket}/{$key}");
+        }
+        try {
+            $response->sendStream($stream, $length, $options + ['size' => $fileSize]);
+        } finally {
+            fclose($stream);
+        }
     }
 
     private function parseRangeHeader(string $rangeHeader, int $fileSize): ?array
     {
         $rangeHeader = trim($rangeHeader);
+        if ($fileSize === 0) {
+            return null;
+        }
 
         if (preg_match('/^bytes=(\d+)-(\d*)$/', $rangeHeader, $matches)) {
             $start = (int)$matches[1];
@@ -232,8 +244,14 @@ class ObjectController
         $asciiFallback = str_replace('"', '\\"', $asciiFallback);
         $disposition = 'inline; filename="' . $asciiFallback . '"; filename*=UTF-8\'\'' . rawurlencode($filename);
 
+        // Apache 2.4's HTTP header filter removes the literal "0" on HEAD.
+        // "00" is the same decimal length (RFC 9110 section 8.6, 1*DIGIT),
+        // but survives that filter so S3 clients can download empty objects.
+        $contentLength = $meta['size'] === 0 ? '00' : (string)$meta['size'];
+
+        MetadataHeaders::apply($response, $meta['metadata'] ?? []);
         $response
-            ->setHeader('Content-Length', (string)$meta['size'])
+            ->setHeader('Content-Length', $contentLength)
             ->setHeader('Content-Type', $meta['mime'])
             ->setHeader('Content-Disposition', $disposition)
             ->setHeader('Last-Modified', gmdate('D, d M Y H:i:s \G\M\T', $meta['mtime']))

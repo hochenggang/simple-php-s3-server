@@ -31,12 +31,18 @@ class ObjectControllerTest extends TestCase
         $this->cleanupDir($this->testDir);
     }
 
-    private function createRequest(string $method, string $uri, string $queryString = ''): Request
+    private function createRequest(string $method, string $uri, string $queryString = '', string $body = ''): Request
     {
         $_SERVER['REQUEST_METHOD'] = $method;
         $_SERVER['REQUEST_URI'] = $uri;
         $_SERVER['QUERY_STRING'] = $queryString;
-        return new Request();
+        if ($body === '') {
+            return new Request();
+        }
+        $input = fopen('php://temp/maxmemory:2097152', 'w+b');
+        fwrite($input, $body);
+        rewind($input);
+        return new Request($input);
     }
 
     public function testGetObjectReturnsContentAndMetadataHeaders(): void
@@ -46,22 +52,22 @@ class ObjectControllerTest extends TestCase
 
         $request = $this->createRequest('GET', '/obj-bucket/file.txt');
 
-        // Spy that captures the options getObject hands to sendFile, instead of
+        // Spy that captures the options getObject hands to sendStream, instead of
         // emitting headers (headers_list() is unreliable in the CLI SAPI).
         $response = new class extends Response {
-            public ?string $capturedFile = null;
+            public ?string $capturedContent = null;
             public array $capturedOptions = [];
-            public function sendFile(string $filePath, array $options = []): void
+            public function sendStream($stream, int $length, array $options = []): void
             {
-                $this->capturedFile = $filePath;
+                $this->capturedContent = stream_get_contents($stream, $length);
                 $this->capturedOptions = $options;
             }
         };
 
         $this->controller->getObject($request, $response);
 
-        $this->assertNotNull($response->capturedFile);
-        $this->assertEquals('hello world', file_get_contents($response->capturedFile));
+        $this->assertNotNull($response->capturedContent);
+        $this->assertEquals('hello world', $response->capturedContent);
 
         // GET must pass through the same metadata HEAD exposes.
         $this->assertNotEmpty($response->capturedOptions['etag']);
@@ -83,6 +89,37 @@ class ObjectControllerTest extends TestCase
         $this->controller->getObject($request, $response);
     }
 
+    public function testHeadPreservesEmptyLengthThroughApacheWithoutSendingBody(): void
+    {
+        $this->storage->createBucket('head-bucket');
+        foreach (['empty' => '', 'nonempty' => 'hello'] as $key => $body) {
+            $this->storage->putObjectFromString('head-bucket', $key, $body);
+            $response = new class extends Response {
+                public array $capturedHeaders = [];
+                public int $status = 0;
+                public function setHeader(string $name, string $value): self
+                {
+                    $this->capturedHeaders[$name] = $value;
+                    return $this;
+                }
+                public function sendEmpty(int $statusCode = 204): void
+                {
+                    $this->status = $statusCode;
+                }
+            };
+            ob_start();
+            try {
+                $this->controller->headObject($this->createRequest('HEAD', '/head-bucket/' . $key), $response);
+            } finally {
+                $output = ob_get_clean();
+            }
+            self::assertSame('', $output);
+            self::assertSame(200, $response->status);
+            self::assertSame($body === '' ? '00' : '5', $response->capturedHeaders['Content-Length']);
+            self::assertSame(strlen($body), (int)$response->capturedHeaders['Content-Length']);
+        }
+    }
+
     public function testGetObjectOnMissingKeyReturnsNoSuchKey(): void
     {
         $this->storage->createBucket('missing-bucket');
@@ -99,11 +136,7 @@ class ObjectControllerTest extends TestCase
         $this->storage->createBucket('etag-bucket');
         $this->storage->putObjectFromString('etag-bucket', 'my%20file.txt', 'test data');
 
-        // ETag as calculated by putObject's controller logic (canonicalizeKey)
-        $expectedEtag = $this->storage->getMetaReader()->calculateEtag(
-            $this->storage->getPathResolver()->canonicalizeKey('my%20file.txt'),
-            strlen('test data')
-        );
+        $expectedEtag = md5('test data');
 
         // ETag as returned by LIST (from disk, decoded key)
         $result = $this->storage->listObjects('etag-bucket');
@@ -117,11 +150,8 @@ class ObjectControllerTest extends TestCase
         $this->storage->putObjectFromString('copy-bucket', 'source.txt', 'data');
         $this->storage->copyObject('copy-bucket', 'source.txt', 'copy-bucket', 'dest%20file.txt');
 
-        // ETag as calculated by handleCopyObject's controller logic (canonicalizeKey)
-        $expectedEtag = $this->storage->getMetaReader()->calculateEtag(
-            $this->storage->getPathResolver()->canonicalizeKey('dest%20file.txt'),
-            4 // strlen('data')
-        );
+        // The copy carries the source's content ETag.
+        $expectedEtag = md5('data');
 
         // ETag as returned by LIST (from disk, decoded key)
         $result = $this->storage->listObjects('copy-bucket');
@@ -161,9 +191,7 @@ class ObjectControllerTest extends TestCase
         }
         $xml .= '</Delete>';
 
-        $request = $this->createRequest('POST', '/del-bucket', 'delete');
-        $bodyRef = new \ReflectionProperty(Request::class, 'body');
-        $bodyRef->setValue($request, $xml);
+        $request = $this->createRequest('POST', '/del-bucket', 'delete', $xml);
 
         $response = new Response();
 
@@ -178,9 +206,7 @@ class ObjectControllerTest extends TestCase
     public function testDeleteObjectsOnMissingBucketThrowsNoSuchBucket(): void
     {
         $xml = '<Delete><Object><Key>file.txt</Key></Object></Delete>';
-        $request = $this->createRequest('POST', '/missing-bucket', 'delete');
-        $bodyRef = new \ReflectionProperty(Request::class, 'body');
-        $bodyRef->setValue($request, $xml);
+        $request = $this->createRequest('POST', '/missing-bucket', 'delete', $xml);
 
         try {
             $this->controller->deleteObjects($request, new Response());

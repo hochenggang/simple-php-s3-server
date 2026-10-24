@@ -7,17 +7,19 @@ use S3Gateway\Exception\S3Exception;
 use S3Gateway\Logger;
 use Symfony\Component\Filesystem\Path;
 
-class FileStorage
+class FileStorage implements MultipartStorage
 {
     private const STREAM_BUFFER_SIZE = 65536;
 
     private PathResolver $pathResolver;
     private MetaReader $metaReader;
+    private SidecarStore $sidecars;
 
     public function __construct()
     {
         $this->pathResolver = new PathResolver();
-        $this->metaReader = new MetaReader($this->pathResolver);
+        $this->sidecars = new SidecarStore($this->pathResolver);
+        $this->metaReader = new MetaReader($this->pathResolver, $this->sidecars);
     }
 
     public function getPathResolver(): PathResolver
@@ -28,6 +30,116 @@ class FileStorage
     public function getMetaReader(): MetaReader
     {
         return $this->metaReader;
+    }
+
+    public function validateBucketName(string $bucket): void
+    {
+        $this->pathResolver->validateBucketName($bucket);
+    }
+
+    public function getBucketCreationTime(string $bucket): int
+    {
+        return @filemtime($this->pathResolver->bucketPath($bucket)) ?: time();
+    }
+
+    public function openObject(string $bucket, string $key, int $start = 0, ?int $length = null)
+    {
+        $path = $this->pathResolver->objectPath($bucket, $key);
+        if (!is_file($path)) {
+            return false;
+        }
+        $stream = @fopen($path, 'rb');
+        if ($stream !== false && $start > 0 && fseek($stream, $start) !== 0) {
+            fclose($stream);
+            return false;
+        }
+        return $stream;
+    }
+
+    public function putObjectFromStream(string $bucket, string $key, $input, ?ObjectMetadata $metadata = null): ?array
+    {
+        $path = $this->pathResolver->objectPath($bucket, $key);
+        if (!$this->writeStreamAtomically($path, $input, $metadata)) {
+            return null;
+        }
+        return $this->getObjectMeta($bucket, $key);
+    }
+
+    /** Write $input to $path via a sibling temp file and record its content MD5 and metadata. */
+    private function writeStreamAtomically(string $path, $input, ?ObjectMetadata $metadata = null): bool
+    {
+        if (!is_resource($input) || !$this->pathResolver->ensureParentDir($path)) {
+            return false;
+        }
+        $temporary = $path . '.' . bin2hex(random_bytes(8)) . '.tmp';
+        $output = @fopen($temporary, 'xb');
+        if ($output === false) {
+            return false;
+        }
+        try {
+            $md5 = SidecarStore::copyWithMd5($input, $output);
+            if ($md5 === null || !fflush($output)) {
+                return false;
+            }
+            fclose($output);
+            $output = null;
+            if (!@rename($temporary, $path)) {
+                return false;
+            }
+            $this->sidecars->record($path, $md5, $metadata);
+            return true;
+        } finally {
+            if (is_resource($output)) {
+                fclose($output);
+            }
+            if (file_exists($temporary)) {
+                @unlink($temporary);
+            }
+        }
+    }
+
+    public function multipartUploadExists(string $bucket, string $uploadId): bool
+    {
+        return is_dir($this->pathResolver->multipartPath($bucket, $uploadId));
+    }
+
+    public function getPartMeta(string $bucket, string $uploadId, int $partNumber): ?array
+    {
+        return $this->metaReader->getPartMeta($bucket, $uploadId, $partNumber);
+    }
+
+    public function savePartFromStream(string $bucket, string $uploadId, int $partNumber, $input): ?array
+    {
+        $path = $this->pathResolver->partPath($bucket, $uploadId, $partNumber);
+        if (!$this->writeStreamAtomically($path, $input)) {
+            return null;
+        }
+        return $this->getPartMeta($bucket, $uploadId, $partNumber);
+    }
+
+    public function cleanupExpiredMultipartUploads(int $before): array
+    {
+        $removed = $bytes = 0;
+        foreach ($this->listBuckets() as $bucket) {
+            $base = $this->pathResolver->bucketPath($bucket) . '/.multipart';
+            foreach (glob($base . '/*', GLOB_ONLYDIR) ?: [] as $directory) {
+                if (filemtime($directory) >= $before) {
+                    continue;
+                }
+                $size = 0;
+                $files = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS));
+                foreach ($files as $file) {
+                    if ($file->isFile()) {
+                        $size += $file->getSize();
+                    }
+                }
+                if ($this->safeDeleteDirectory($directory)) {
+                    ++$removed;
+                    $bytes += $size;
+                }
+            }
+        }
+        return ['removed' => $removed, 'bytes' => $bytes];
     }
 
     public function listBuckets(): array
@@ -190,7 +302,7 @@ class FileStorage
                     'key' => $s3Key,
                     'size' => $size,
                     'timestamp' => $fileInfo->getMTime(),
-                    'etag' => $this->metaReader->calculateEtag($s3Key, $size)
+                    'etag' => $this->sidecars->get($path) ?? ''
                 ];
             }
         }
@@ -306,7 +418,11 @@ class FileStorage
         $items = array_values(array_diff($items, ['.', '..', '.multipart']));
 
         // Only delete when no business entries remain.
-        return count($items) === 0 && @rmdir($bucketPath);
+        if (count($items) !== 0 || !@rmdir($bucketPath)) {
+            return false;
+        }
+        $this->sidecars->forgetBucket($bucket);
+        return true;
     }
 
     public function bucketExists(string $bucket): bool
@@ -369,10 +485,11 @@ class FileStorage
             return false;
         }
 
+        $this->sidecars->record($filePath, md5($content));
         return true;
     }
 
-    public function copyObject(string $sourceBucket, string $sourceKey, string $destBucket, string $destKey): bool
+    public function copyObject(string $sourceBucket, string $sourceKey, string $destBucket, string $destKey, ?ObjectMetadata $replaceMetadata = null): bool
     {
         $sourcePath = $this->pathResolver->objectPath($sourceBucket, $sourceKey);
         $destPath = $this->pathResolver->objectPath($destBucket, $destKey);
@@ -385,7 +502,27 @@ class FileStorage
             return false;
         }
 
-        return @copy($sourcePath, $destPath);
+        $etag = $this->sidecars->get($sourcePath);
+        if ($etag === null) {
+            return false;
+        }
+        $metadata = $replaceMetadata ?? $this->sidecars->metadata($sourcePath);
+
+        // A copy onto itself changes only the metadata; copy() would fail on
+        // identical paths, and the content stays as it is.
+        if (realpath($sourcePath) === realpath($destPath)) {
+            if ($replaceMetadata === null) {
+                return false;
+            }
+            $this->sidecars->record($destPath, $etag, $metadata);
+            return true;
+        }
+
+        if (!@copy($sourcePath, $destPath)) {
+            return false;
+        }
+        $this->sidecars->record($destPath, $etag, $metadata);
+        return true;
     }
 
     public function deleteObject(string $bucket, string $key): bool
@@ -399,6 +536,7 @@ class FileStorage
         $result = @unlink($filePath);
 
         if ($result) {
+            $this->sidecars->forget($bucket, $filePath);
             $this->cleanupEmptyDirectories($bucket, dirname($filePath));
         }
 
@@ -476,8 +614,11 @@ class FileStorage
 
         $partPath = $this->pathResolver->partPath($bucket, $uploadId, $partNumber);
 
-        $result = @file_put_contents($partPath, $content);
-        return $result !== false;
+        if (@file_put_contents($partPath, $content) === false) {
+            return false;
+        }
+        $this->sidecars->record($partPath, md5($content));
+        return true;
     }
 
     public function completeMultipartUpload(string $bucket, string $key, string $uploadId, array $parts): ?array
@@ -502,17 +643,20 @@ class FileStorage
         }
 
         $totalBytesWritten = 0;
+        $partMd5s = [];
 
         try {
             ksort($parts);
 
             foreach (array_keys($parts) as $partNumber) {
                 $partPath = $this->pathResolver->partPath($bucket, $uploadId, $partNumber);
-                if (!file_exists($partPath)) {
+                $partMd5 = $this->sidecars->get($partPath);
+                if ($partMd5 === null) {
                     fclose($fp);
                     @unlink($tempPath);
                     return null;
                 }
+                $partMd5s[] = $partMd5;
 
                 clearstatcache(true, $partPath);
                 $partSize = filesize($partPath);
@@ -558,9 +702,9 @@ class FileStorage
                 return null;
             }
 
+            $etag = SidecarStore::multipartEtag($partMd5s);
+            $this->sidecars->record($filePath, $etag, $this->readUploadMetadata($uploadDir));
             $this->safeDeleteDirectory($uploadDir);
-
-            $etag = $this->metaReader->calculateEtag($this->pathResolver->canonicalizeKey($key), $finalSize);
 
             \S3Gateway\Logger::info("Multipart upload completed: bucket={$bucket}, key={$key}, uploadId={$uploadId}, size={$finalSize}, etag={$etag}");
 
@@ -600,10 +744,21 @@ class FileStorage
         $this->safeDeleteDirectory($multipartBaseDir);
     }
 
-    public function createMultipartUpload(string $bucket, string $uploadId): bool
+    public function createMultipartUpload(string $bucket, string $uploadId, ?ObjectMetadata $metadata = null): bool
     {
         $uploadDir = $this->pathResolver->multipartPath($bucket, $uploadId);
-        return $this->pathResolver->ensureDir($uploadDir);
+        if (!$this->pathResolver->ensureDir($uploadDir)) {
+            return false;
+        }
+        // Part files have numeric names, so this file is never taken for a part.
+        return $metadata === null
+            || @file_put_contents(Path::join($uploadDir, 'upload.json'), json_encode($metadata->toArray())) !== false;
+    }
+
+    private function readUploadMetadata(string $uploadDir): ?ObjectMetadata
+    {
+        $data = json_decode((string)@file_get_contents(Path::join($uploadDir, 'upload.json')), true);
+        return is_array($data) ? ObjectMetadata::fromArray($data) : null;
     }
 
     private function safeDeleteDirectory(string $dir): bool
