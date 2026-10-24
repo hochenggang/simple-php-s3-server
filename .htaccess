@@ -3,6 +3,7 @@
     Header always set Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS, HEAD"
     Header always set Access-Control-Allow-Headers "*"
     Header always set Access-Control-Max-Age "86400"
+    Header always set Access-Control-Expose-Headers "ETag, Content-Range, Accept-Ranges"
 </IfModule>
 
 <IfModule mod_rewrite.c>
