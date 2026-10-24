@@ -6,7 +6,8 @@ while (ob_get_level() > 0) {
 
 ini_set('output_buffering', '0');
 ini_set('implicit_flush', '1');
-ini_set('display_errors', '1');
+// Diagnostics belong in the log; output would corrupt S3 bodies and headers.
+ini_set('display_errors', '0');
 error_reporting(E_ALL);
 
 define('ERROR_LOG_FILE', __DIR__ . '/error_log');

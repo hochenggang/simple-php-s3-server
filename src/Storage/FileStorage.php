@@ -7,7 +7,7 @@ use S3Gateway\Exception\S3Exception;
 use S3Gateway\Logger;
 use Symfony\Component\Filesystem\Path;
 
-class FileStorage
+class FileStorage implements MultipartStorage
 {
     private const STREAM_BUFFER_SIZE = 65536;
 
@@ -28,6 +28,110 @@ class FileStorage
     public function getMetaReader(): MetaReader
     {
         return $this->metaReader;
+    }
+
+    public function validateBucketName(string $bucket): void
+    {
+        $this->pathResolver->validateBucketName($bucket);
+    }
+
+    public function getBucketCreationTime(string $bucket): int
+    {
+        return @filemtime($this->pathResolver->bucketPath($bucket)) ?: time();
+    }
+
+    public function openObject(string $bucket, string $key, int $start = 0, ?int $length = null)
+    {
+        $path = $this->pathResolver->objectPath($bucket, $key);
+        if (!is_file($path)) {
+            return false;
+        }
+        $stream = @fopen($path, 'rb');
+        if ($stream !== false && $start > 0 && fseek($stream, $start) !== 0) {
+            fclose($stream);
+            return false;
+        }
+        return $stream;
+    }
+
+    public function putObjectFromStream(string $bucket, string $key, $input): ?array
+    {
+        $path = $this->pathResolver->objectPath($bucket, $key);
+        if (!$this->writeStreamAtomically($path, $input)) {
+            return null;
+        }
+        return $this->getObjectMeta($bucket, $key);
+    }
+
+    private function writeStreamAtomically(string $path, $input): bool
+    {
+        if (!is_resource($input) || !$this->pathResolver->ensureParentDir($path)) {
+            return false;
+        }
+        $temporary = $path . '.' . bin2hex(random_bytes(8)) . '.tmp';
+        $output = @fopen($temporary, 'xb');
+        if ($output === false) {
+            return false;
+        }
+        try {
+            if (stream_copy_to_stream($input, $output) === false || !fflush($output)) {
+                return false;
+            }
+            fclose($output);
+            $output = null;
+            return @rename($temporary, $path);
+        } finally {
+            if (is_resource($output)) {
+                fclose($output);
+            }
+            if (file_exists($temporary)) {
+                @unlink($temporary);
+            }
+        }
+    }
+
+    public function multipartUploadExists(string $bucket, string $uploadId): bool
+    {
+        return is_dir($this->pathResolver->multipartPath($bucket, $uploadId));
+    }
+
+    public function getPartMeta(string $bucket, string $uploadId, int $partNumber): ?array
+    {
+        return $this->metaReader->getPartMeta($bucket, $uploadId, $partNumber);
+    }
+
+    public function savePartFromStream(string $bucket, string $uploadId, int $partNumber, $input): ?array
+    {
+        $path = $this->pathResolver->partPath($bucket, $uploadId, $partNumber);
+        if (!$this->writeStreamAtomically($path, $input)) {
+            return null;
+        }
+        return $this->getPartMeta($bucket, $uploadId, $partNumber);
+    }
+
+    public function cleanupExpiredMultipartUploads(int $before): array
+    {
+        $removed = $bytes = 0;
+        foreach ($this->listBuckets() as $bucket) {
+            $base = $this->pathResolver->bucketPath($bucket) . '/.multipart';
+            foreach (glob($base . '/*', GLOB_ONLYDIR) ?: [] as $directory) {
+                if (filemtime($directory) >= $before) {
+                    continue;
+                }
+                $size = 0;
+                $files = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($directory, \FilesystemIterator::SKIP_DOTS));
+                foreach ($files as $file) {
+                    if ($file->isFile()) {
+                        $size += $file->getSize();
+                    }
+                }
+                if ($this->safeDeleteDirectory($directory)) {
+                    ++$removed;
+                    $bytes += $size;
+                }
+            }
+        }
+        return ['removed' => $removed, 'bytes' => $bytes];
     }
 
     public function listBuckets(): array

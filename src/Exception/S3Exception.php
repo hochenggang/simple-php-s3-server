@@ -39,9 +39,9 @@ class S3Exception extends \Exception
         return new self('InvalidAccessKeyId', 'The AWS Access Key Id you provided does not exist in our records.', 403);
     }
 
-    public static function signatureDoesNotMatch(): self
+    public static function signatureDoesNotMatch(string $message = 'The request signature we calculated does not match the signature you provided.'): self
     {
-        return new self('SignatureDoesNotMatch', 'The request signature we calculated does not match the signature you provided.', 403);
+        return new self('SignatureDoesNotMatch', $message, 403);
     }
 
     public static function noSuchBucket(string $resource = ''): self
@@ -112,5 +112,19 @@ class S3Exception extends \Exception
     public static function expiredToken(string $message = 'The provided token has expired.'): self
     {
         return new self('ExpiredToken', $message, 400);
+    }
+
+    public static function xAmzContentSha256Mismatch(): self
+    {
+        return new self(
+            'XAmzContentSHA256Mismatch',
+            'The provided x-amz-content-sha256 header does not match what was computed.',
+            400
+        );
+    }
+
+    public static function xAmzContentChecksumInvalid(string $message = 'Provided value did not match the computed checksum', string $resource = ''): self
+    {
+        return new self('XAmzContentChecksumInvalid', $message, 400, $resource);
     }
 }

@@ -15,7 +15,7 @@ class MetaReader
     {
         $filePath = $this->pathResolver->objectPath($bucket, $key);
 
-        if (!file_exists($filePath)) {
+        if (!is_file($filePath)) {
             return null;
         }
 
@@ -45,7 +45,7 @@ class MetaReader
 
     public function getFileSize(string $filePath): int
     {
-        if (!file_exists($filePath)) {
+        if (!is_file($filePath)) {
             return 0;
         }
 
@@ -57,7 +57,7 @@ class MetaReader
 
     public function getFileMtime(string $filePath): int
     {
-        if (!file_exists($filePath)) {
+        if (!is_file($filePath)) {
             return 0;
         }
 

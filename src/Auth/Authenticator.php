@@ -93,6 +93,11 @@ class Authenticator
 
             $this->validateTimestamp($signatureData);
 
+            // Without x-amz-content-sha256 the signature calculation spools
+            // the body; it must do so under this key's limit, not only the
+            // global one (which may be 0 = unlimited).
+            $this->request->setClaimedAccessKeyId($accessKeyId);
+
             // Try current method first, then alternate for HEAD/GET compatibility
             $methodsToTry = $this->getMethodsWithFallback();
 
@@ -101,6 +106,7 @@ class Authenticator
                 $calculatedSignature = $this->calculateSignatureV4($stringToSign, $secretKey, $signatureData);
 
                 if (hash_equals($calculatedSignature, $signatureData['Signature'])) {
+                    $this->armVerification($accessKeyId, $secretKey, $signatureData);
                     return $accessKeyId;
                 }
             }
@@ -112,6 +118,44 @@ class Authenticator
             Logger::error("[Auth] V4 authentication error: " . $e->getMessage());
             throw S3Exception::accessDenied();
         }
+    }
+
+    /**
+     * Once the request signature matched, record the authenticated key and
+     * arm payload verification for the body spool:
+     * - declared 64-hex hash  -> compared against the spooled bytes;
+     * - STREAMING-AWS4-HMAC-SHA256-PAYLOAD[-TRAILER] -> per-chunk signatures
+     *   (and the trailer signature) are verified with the derived signing
+     *   key during spooling;
+     * - UNSIGNED-PAYLOAD / STREAMING-UNSIGNED-PAYLOAD-TRAILER -> framing
+     *   decode only, matching S3 semantics for these modes;
+     * - any other STREAMING-* mode (e.g. ECDSA) is rejected rather than
+     *   silently accepted unverified.
+     */
+    private function armVerification(string $accessKeyId, string $secretKey, array $signatureData): void
+    {
+        $declared = $this->request->getHeader('X-Amz-Content-Sha256');
+        $streamCtx = null;
+        if ($declared !== null && str_starts_with($declared, 'STREAMING-')) {
+            $signedModes = [
+                'STREAMING-AWS4-HMAC-SHA256-PAYLOAD' => false,
+                'STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER' => true,
+            ];
+            if (isset($signedModes[$declared])) {
+                $streamCtx = [
+                    'secret' => $secretKey,
+                    'amzDate' => $this->getAmzDate($this->request->getHeaders()),
+                    'region' => $signatureData['Credential']['Region'],
+                    'service' => $signatureData['Credential']['Service'],
+                    'signature' => $signatureData['Signature'],
+                    'trailer' => $signedModes[$declared],
+                ];
+            } elseif ($declared !== 'STREAMING-UNSIGNED-PAYLOAD-TRAILER') {
+                throw S3Exception::invalidRequest("Unsupported x-amz-content-sha256 mode: {$declared}");
+            }
+        }
+        $this->request->setAccessKeyId($accessKeyId);
+        $this->request->armPayloadVerification($declared, $streamCtx);
     }
 
     private function parseSignatureV4Header(string $authHeader): array
@@ -185,13 +229,12 @@ class Authenticator
         $uri = $this->request->getUri();
         $queryString = $this->request->getQueryString();
         $headers = $this->request->getHeaders();
-        $body = $this->request->getBody();
 
         $canonicalUri = $this->encodeUri($uri);
         $canonicalQueryString = $this->normalizeQueryString($queryString);
         $canonicalHeaders = $this->buildCanonicalHeaders($headers, $signatureData['SignedHeaders']);
         $signedHeaders = strtolower($signatureData['SignedHeaders']);
-        $hashedPayload = $this->getPayloadHash($headers, $body, $method);
+        $hashedPayload = $this->getPayloadHash($headers, $method);
 
         $canonicalRequest = implode("\n", [
             $method,
@@ -259,7 +302,13 @@ class Authenticator
         return gmdate('Ymd\THis\Z');
     }
 
-    private function getPayloadHash(array $headers, string $body, ?string $overrideMethod = null): string
+    /**
+     * Payload hash for the canonical request. Normally the client declares it
+     * via x-amz-content-sha256 (a real hash, or one of the UNSIGNED/STREAMING
+     * placeholders); the body itself is not read here. Only the legacy path
+     * without the header computes it, through the bounded spool.
+     */
+    private function getPayloadHash(array $headers, ?string $overrideMethod = null): string
     {
         $contentSha256 = $this->findHeader($headers, 'x-amz-content-sha256');
         if ($contentSha256 !== null) {
@@ -273,7 +322,7 @@ class Authenticator
             return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
         }
 
-        return hash('sha256', $body);
+        return $this->request->getPayloadSha256();
     }
 
     private function normalizeQueryString(string $queryString): string
@@ -376,6 +425,20 @@ class Authenticator
                 $calculatedSignature = $this->calculatePresignedUrlSignature($stringToSign, $secretKey, $presignedData);
 
                 if (hash_equals($calculatedSignature, $presignedData['Signature'])) {
+                    // Presigned URLs sign UNSIGNED-PAYLOAD; if the client still
+                    // declared a real content hash, verifying it is free
+                    // integrity. Signed streaming has no header signature to
+                    // seed its chain here, so reject it instead of accepting
+                    // the chunks unverified.
+                    $declared = $this->request->getHeader('X-Amz-Content-Sha256');
+                    if ($declared !== null && str_starts_with($declared, 'STREAMING-')
+                        && $declared !== 'STREAMING-UNSIGNED-PAYLOAD-TRAILER') {
+                        throw S3Exception::invalidRequest(
+                            "Unsupported x-amz-content-sha256 mode for presigned URL: {$declared}"
+                        );
+                    }
+                    $this->request->setAccessKeyId($accessKeyId);
+                    $this->request->armPayloadVerification($declared);
                     return $accessKeyId;
                 }
             }
@@ -543,44 +606,75 @@ class Authenticator
 
     // ─── Request size check ────────────────────────────────────────────
 
+    /**
+     * Reject bodies above the key's limit. Header-based values give a cheap
+     * early rejection; the authoritative check happens inside the spool while
+     * streaming decoded bytes (a forged Content-Length cannot hide an
+     * oversized body from it). For aws-chunked uploads the wire Content-Length
+     * includes framing/checksum overhead, so only X-Amz-Decoded-Content-Length
+     * counts against the object limit.
+     */
     public function checkRequestSize(string $accessKeyId): void
     {
-        // Per-key quota first; fall back to global MAX_UPLOAD_SIZE when unset,
-        // so a forged Content-Length: 0 cannot bypass the early header check.
-        $maxSize = Config::getFileMaxSize($accessKeyId);
-        if ($maxSize <= 0) {
-            $maxSize = Config::maxUploadSize();
+        // Ensure per-key limits apply even when callers skip authentication
+        // (tests, custom front controllers).
+        if ($accessKeyId !== '' && $this->request->getAccessKeyId() === null) {
+            $this->request->setAccessKeyId($accessKeyId);
         }
-        if ($maxSize <= 0) {
+
+        $maxSize = $this->request->maxBodyBytes();
+        if ($maxSize === null) {
             return;
         }
 
-        // Use the larger of Content-Length header and actual decoded body size.
-        // Relying on the header alone allows a client to forge Content-Length: 0
-        // while streaming a large body. For methods without a body (GET/HEAD/DELETE)
-        // getBody() returns '' without touching php://input, so this stays cheap.
-        $contentLength = $this->request->getHeader('Content-Length');
-        $headerSize = $contentLength !== null ? (int)$contentLength : 0;
-        $actualSize = max($headerSize, strlen($this->request->getBody()));
-
-        if ($actualSize > $maxSize) {
-            throw S3Exception::entityTooLarge($actualSize, $maxSize);
+        $known = [$this->request->spoolSize() ?? 0];
+        if ($this->request->isAwsChunked()) {
+            $hint = $this->request->getDecodedLengthHint();
+            if ($hint !== null) {
+                $known[] = $hint;
+            }
+        } else {
+            $contentLength = $this->request->getHeader('Content-Length');
+            if ($contentLength !== null) {
+                $known[] = (int)$contentLength;
+            }
         }
+
+        $declaredSize = max($known);
+        if ($declaredSize > $maxSize) {
+            throw S3Exception::entityTooLarge($declaredSize, $maxSize);
+        }
+
+        // Authoritative enforcement: spools the body under the limit for
+        // methods that can carry one; no-op for GET/HEAD/DELETE/OPTIONS.
+        $this->request->enforceBodyLimit();
     }
 
     /**
      * 早期请求大小检查：基于 Content-Length 头，在认证前拒绝超大请求。
      * 全局上限 = MAX_UPLOAD_SIZE 配置（默认 8MB）。
      * 若配置为 0（不限制），跳过，回退到认证后的 per-key checkRequestSize()。
+     * aws-chunked uploads: the wire length counts framing overhead; use the
+     * decoded hint when present and defer to spool-time enforcement otherwise.
      */
     public function checkEarlyRequestSize(): void
     {
+        $globalMax = Config::maxUploadSize();
+        if ($globalMax <= 0) {
+            return;
+        }
+        if ($this->request->isAwsChunked()) {
+            $hint = $this->request->getDecodedLengthHint();
+            if ($hint !== null && $hint > $globalMax) {
+                throw S3Exception::entityTooLarge($hint, $globalMax);
+            }
+            return;
+        }
         $contentLength = $this->request->getHeader('Content-Length');
         if ($contentLength === null) {
             return;
         }
-        $globalMax = Config::maxUploadSize();
-        if ($globalMax > 0 && (int)$contentLength > $globalMax) {
+        if ((int)$contentLength > $globalMax) {
             throw S3Exception::entityTooLarge((int)$contentLength, $globalMax);
         }
     }

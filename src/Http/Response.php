@@ -64,109 +64,67 @@ class Response
         }
     }
 
+    /** Legacy convenience method. Object controllers use backend streams. */
     public function sendFile(string $filePath, array $options = []): void
     {
-        if (!file_exists($filePath)) {
-            http_response_code(404);
-            header('Content-Type: text/plain');
-            echo 'File not found';
-            return;
-        }
-
-        clearstatcache(true, $filePath);
-        $fileSize = filesize($filePath);
-
-        if ($fileSize === false || $fileSize < 0) {
-            http_response_code(500);
-            header('Content-Type: text/plain');
-            echo 'Cannot read file size';
-            return;
-        }
-
-        // Open the file BEFORE emitting any headers so a fopen failure can still
-        // produce a clean 500 without a stale Content-Length confusing the client.
-        $fp = fopen($filePath, 'rb');
+        $fp = @fopen($filePath, 'rb');
         if ($fp === false) {
-            http_response_code(500);
-            header('Content-Type: text/plain');
-            echo 'Failed to open file';
+            http_response_code(404);
             return;
         }
+        try {
+            $size = fstat($fp)['size'];
+            $start = $options['start'] ?? 0;
+            if ($start > 0 && fseek($fp, $start) !== 0) {
+                throw new \RuntimeException('Cannot seek object stream');
+            }
+            $options += ['size' => $size, 'mime' => $this->detectMimeType($filePath), 'filename' => basename($filePath)];
+            $length = !empty($options['partial']) ? ($options['end'] ?? ($size - 1)) - $start + 1 : $size;
+            $this->sendStream($fp, $length, $options);
+        } finally {
+            fclose($fp);
+        }
+    }
 
-        $start = $options['start'] ?? 0;
-        $end = $options['end'] ?? ($fileSize - 1);
+    /** Send a positioned readable stream; the caller retains ownership. */
+    public function sendStream($stream, int $length, array $options = []): void
+    {
+        if (!is_resource($stream) || $length < 0) {
+            throw new \InvalidArgumentException('Invalid response stream or length');
+        }
         $partial = $options['partial'] ?? false;
-
-        if ($start > 0) {
-            if (fseek($fp, $start) !== 0) {
-                fclose($fp);
-                http_response_code(500);
-                header('Content-Type: text/plain');
-                echo 'Seek failed';
-                return;
-            }
+        http_response_code($partial ? 206 : 200);
+        foreach ($this->headers as $name => $value) {
+            header($name . ': ' . $value);
         }
-
-        if ($partial) {
-            $statusCode = 206;
-            $contentLength = $end - $start + 1;
-            $contentRange = 'Content-Range: bytes ' . $start . '-' . $end . '/' . $fileSize;
-            $contentLengthHeader = 'Content-Length: ' . $contentLength;
-        } else {
-            $statusCode = 200;
-            $contentLengthHeader = 'Content-Length: ' . $fileSize;
-            $contentRange = null;
-        }
-
-        $mimeType = $options['mime'] ?? $this->detectMimeType($filePath);
-        $filename = $options['filename'] ?? basename($filePath);
-
-        // RFC 6266 Content-Disposition: ASCII fallback (quoted) + UTF-8 filename*
-        // for non-ASCII names. Avoids the incomplete '"'→'\\"' escaping of the
-        // previous implementation which left backslashes and control chars loose.
-        $asciiFallback = preg_replace('/[^\x20-\x7e]/', '_', $filename);
-        $asciiFallback = str_replace('"', '\\"', $asciiFallback);
-        $disposition = 'inline; filename="' . $asciiFallback . '"; filename*=UTF-8\'\'' . rawurlencode($filename);
-
-        http_response_code($statusCode);
-        header('Content-Type: ' . $mimeType);
+        header('Content-Type: ' . ($options['mime'] ?? 'application/octet-stream'));
+        header('Content-Length: ' . $length);
         header('Accept-Ranges: bytes');
-        header('Content-Disposition: ' . $disposition);
-        header($contentLengthHeader);
-        if ($contentRange !== null) {
-            header($contentRange);
+        if ($partial) {
+            $start = $options['start'] ?? 0;
+            header('Content-Range: bytes ' . $start . '-' . ($start + $length - 1) . '/' . $options['size']);
         }
-
-        // Metadata headers (kept consistent with HEAD responses).
-        if (isset($options['etag']) && $options['etag'] !== '') {
-            $etag = $options['etag'];
-            if (!str_starts_with($etag, '"')) {
-                $etag = '"' . $etag . '"';
-            }
-            header('ETag: ' . $etag);
+        $filename = $options['filename'] ?? 'object';
+        $fallback = preg_replace('/[^\x20-\x7e]/', '_', $filename);
+        $fallback = str_replace('"', '\\"', $fallback);
+        header('Content-Disposition: inline; filename="' . $fallback . '"; filename*=UTF-8\'\'' . rawurlencode($filename));
+        if (!empty($options['etag'])) {
+            header('ETag: "' . trim($options['etag'], '"') . '"');
         }
         if (isset($options['lastModified'])) {
-            // RFC 7232 HTTP-date requires a literal "GMT" suffix; PHP's "T" yields "UTC".
-            header('Last-Modified: ' . gmdate('D, d M Y H:i:s \G\M\T', (int)$options['lastModified']));
+            header('Last-Modified: ' . gmdate('D, d M Y H:i:s \G\M\T', (int) $options['lastModified']));
         }
-
-        $bufferSize = 65536;
-        $bytesSent = 0;
-        $bytesToSend = $end - $start + 1;
-
-        while (!feof($fp) && $bytesSent < $bytesToSend) {
-            $remaining = $bytesToSend - $bytesSent;
-            $readSize = min($bufferSize, $remaining);
-            $buffer = fread($fp, $readSize);
-            if ($buffer === false) {
+        while ($length > 0 && !feof($stream)) {
+            $buffer = fread($stream, min(65536, $length));
+            if ($buffer === false || $buffer === '') {
                 break;
             }
             echo $buffer;
-            flush();
-            $bytesSent += strlen($buffer);
+            $length -= strlen($buffer);
         }
-
-        fclose($fp);
+        if ($length !== 0) {
+            Logger::error('Response stream ended before the declared Content-Length');
+        }
     }
 
     private function detectMimeType(string $filePath): string

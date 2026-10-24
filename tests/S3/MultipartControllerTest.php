@@ -31,12 +31,18 @@ class MultipartControllerTest extends TestCase
         $this->cleanupDir($this->testDir);
     }
 
-    private function createRequest(string $method, string $uri, string $queryString = ''): Request
+    private function createRequest(string $method, string $uri, string $queryString = '', string $body = ''): Request
     {
         $_SERVER['REQUEST_METHOD'] = $method;
         $_SERVER['REQUEST_URI'] = $uri;
         $_SERVER['QUERY_STRING'] = $queryString;
-        return new Request();
+        if ($body === '') {
+            return new Request();
+        }
+        $input = fopen('php://temp/maxmemory:2097152', 'w+b');
+        fwrite($input, $body);
+        rewind($input);
+        return new Request($input);
     }
 
     /**
@@ -83,9 +89,7 @@ class MultipartControllerTest extends TestCase
             . '</CompleteMultipartUpload>';
 
         $_SERVER['HTTP_HOST'] = 'mp-example.local';
-        $completeRequest = $this->createRequest('POST', '/mp-bucket/merged.txt', 'uploadId=' . $uploadId);
-        $bodyRef = new \ReflectionProperty(Request::class, 'body');
-        $bodyRef->setValue($completeRequest, $completeXml);
+        $completeRequest = $this->createRequest('POST', '/mp-bucket/merged.txt', 'uploadId=' . $uploadId, $completeXml);
 
         $completeResponse = new class extends Response {
             public string $capturedBody = '';
@@ -126,9 +130,7 @@ class MultipartControllerTest extends TestCase
             . '<Part><PartNumber>1</PartNumber><ETag>"deadbeef"</ETag></Part>'
             . '</CompleteMultipartUpload>';
 
-        $request = $this->createRequest('POST', '/mp-mismatch-bucket/merged.txt', 'uploadId=' . $uploadId);
-        $bodyRef = new \ReflectionProperty(Request::class, 'body');
-        $bodyRef->setValue($request, $completeXml);
+        $request = $this->createRequest('POST', '/mp-mismatch-bucket/merged.txt', 'uploadId=' . $uploadId, $completeXml);
 
         try {
             $this->controller->completeMultipartUpload($request, new Response());
