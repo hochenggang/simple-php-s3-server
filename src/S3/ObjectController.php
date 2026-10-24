@@ -5,13 +5,13 @@ namespace S3Gateway\S3;
 use S3Gateway\Exception\S3Exception;
 use S3Gateway\Http\Request;
 use S3Gateway\Http\Response;
-use S3Gateway\Storage\FileStorage;
+use S3Gateway\Storage\Storage;
 
 class ObjectController
 {
-    private FileStorage $storage;
+    private Storage $storage;
 
-    public function __construct(FileStorage $storage)
+    public function __construct(Storage $storage)
     {
         $this->storage = $storage;
     }
@@ -40,16 +40,16 @@ class ObjectController
             return;
         }
 
-        $body = $request->getBody();
-
-        if (!$this->storage->putObjectFromString($bucket, $key, $body)) {
-            throw S3Exception::internalError('Failed to write object file', "/{$bucket}/{$key}");
+        $input = $request->getBodyStream();
+        try {
+            $meta = $this->storage->putObjectFromStream($bucket, $key, $input);
+        } finally {
+            fclose($input);
         }
-
-        $etag = $this->storage->getMetaReader()->calculateEtag(
-            $this->storage->getPathResolver()->canonicalizeKey($key),
-            strlen($body)
-        );
+        if ($meta === null) {
+            throw S3Exception::internalError('Failed to store object', "/{$bucket}/{$key}");
+        }
+        $etag = $meta['etag'];
 
         $response
             ->setHeader('ETag', '"' . $etag . '"')
@@ -80,10 +80,7 @@ class ObjectController
             throw S3Exception::noSuchBucket('/' . $sourceBucket);
         }
 
-        $sourcePath = $this->storage->getPathResolver()->objectPath($sourceBucket, $sourceKey);
-        $destPath = $this->storage->getPathResolver()->objectPath($destBucket, $destKey);
-
-        if (!file_exists($sourcePath)) {
+        if (!$this->storage->objectExists($sourceBucket, $sourceKey)) {
             throw S3Exception::noSuchKey($copySource);
         }
 
@@ -96,10 +93,7 @@ class ObjectController
             throw S3Exception::internalError('Failed to read object metadata', "/{$destBucket}/{$destKey}");
         }
 
-        $etag = $this->storage->getMetaReader()->calculateEtag(
-            $this->storage->getPathResolver()->canonicalizeKey($destKey),
-            $meta['size']
-        );
+        $etag = $meta['etag'];
         $lastModified = $meta['mtime'];
 
         $xml = XmlResponse::copyObject('"' . $etag . '"', $lastModified);
@@ -121,13 +115,6 @@ class ObjectController
 
         if (!$this->storage->bucketExists($bucket)) {
             throw S3Exception::noSuchBucket('/' . $bucket);
-        }
-
-        $filePath = $this->storage->getPathResolver()->objectPath($bucket, $key);
-
-        // is_file covers both "not exists" and "is a directory" (key maps to a folder).
-        if (!is_file($filePath)) {
-            throw S3Exception::noSuchKey("/{$bucket}/{$key}");
         }
 
         $meta = $this->storage->getObjectMeta($bucket, $key);
@@ -156,12 +143,25 @@ class ObjectController
             $options['partial'] = true;
         }
 
-        $response->sendFile($filePath, $options);
+        $start = $options['start'] ?? 0;
+        $length = isset($options['end']) ? $options['end'] - $start + 1 : $fileSize;
+        $stream = $this->storage->openObject($bucket, $key, $start, $length);
+        if (!is_resource($stream)) {
+            throw S3Exception::noSuchKey("/{$bucket}/{$key}");
+        }
+        try {
+            $response->sendStream($stream, $length, $options + ['size' => $fileSize]);
+        } finally {
+            fclose($stream);
+        }
     }
 
     private function parseRangeHeader(string $rangeHeader, int $fileSize): ?array
     {
         $rangeHeader = trim($rangeHeader);
+        if ($fileSize === 0) {
+            return null;
+        }
 
         if (preg_match('/^bytes=(\d+)-(\d*)$/', $rangeHeader, $matches)) {
             $start = (int)$matches[1];
@@ -232,8 +232,13 @@ class ObjectController
         $asciiFallback = str_replace('"', '\\"', $asciiFallback);
         $disposition = 'inline; filename="' . $asciiFallback . '"; filename*=UTF-8\'\'' . rawurlencode($filename);
 
+        // Apache 2.4's HTTP header filter removes the literal "0" on HEAD.
+        // "00" is the same decimal length (RFC 9110 section 8.6, 1*DIGIT),
+        // but survives that filter so S3 clients can download empty objects.
+        $contentLength = $meta['size'] === 0 ? '00' : (string)$meta['size'];
+
         $response
-            ->setHeader('Content-Length', (string)$meta['size'])
+            ->setHeader('Content-Length', $contentLength)
             ->setHeader('Content-Type', $meta['mime'])
             ->setHeader('Content-Disposition', $disposition)
             ->setHeader('Last-Modified', gmdate('D, d M Y H:i:s \G\M\T', $meta['mtime']))

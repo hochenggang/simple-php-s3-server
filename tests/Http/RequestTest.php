@@ -94,6 +94,37 @@ class RequestTest extends TestCase
 
     // ─── Bucket & Key Parsing ────────────────────────────────────────
 
+    public function testSubdirectoryRoutingRetainsFullSignedUri(): void
+    {
+        $request = $this->createRequest([
+            'REQUEST_URI' => '/test/api/mybucket/folder/file.txt',
+            'SCRIPT_NAME' => '/test/api/index.php',
+        ]);
+        self::assertSame('mybucket', $request->getBucket());
+        self::assertSame('folder/file.txt', $request->getKey());
+        self::assertSame('/test/api/mybucket/folder/file.txt', $request->getUri());
+    }
+
+    public function testSubdirectoryRootListsBuckets(): void
+    {
+        $request = $this->createRequest([
+            'REQUEST_URI' => '/test/api/',
+            'SCRIPT_NAME' => '/test/api/index.php',
+        ]);
+        self::assertSame('', $request->getBucket());
+        self::assertSame('', $request->getKey());
+    }
+
+    public function testDeploymentPrefixMustMatchWholeDirectory(): void
+    {
+        $request = $this->createRequest([
+            'REQUEST_URI' => '/testing/key',
+            'SCRIPT_NAME' => '/test/index.php',
+        ]);
+        self::assertSame('testing', $request->getBucket());
+        self::assertSame('key', $request->getKey());
+    }
+
     public function testBucketAndKeyParsing(): void
     {
         $request = $this->createRequest([

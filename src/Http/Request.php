@@ -216,7 +216,14 @@ class Request
 
     private function parsePath(): void
     {
-        $path = trim($this->uri, '/');
+        $path = $this->uri;
+        // Route relative to the front controller, but retain the full URI for
+        // SigV4: clients sign the deployment prefix as part of the request path.
+        $base = rtrim(dirname($_SERVER['SCRIPT_NAME'] ?? '/index.php'), '/');
+        if ($base !== '' && str_starts_with($base, '/') && str_starts_with($path, $base . '/')) {
+            $path = substr($path, strlen($base));
+        }
+        $path = trim($path, '/');
         $parts = explode('/', $path, 2);
 
         $this->bucket = $parts[0] ?? '';
@@ -263,6 +270,30 @@ class Request
         // HEAD/GET/list requests never touch the request body, and an early
         // size-check in Router can reject oversized PUTs before they load.
         return $this->body ??= $this->readBody();
+    }
+
+    /**
+     * Caller-owned stream of the decoded request body. This adapter preserves
+     * existing authentication/chunk decoding; getBody() still buffers upstream.
+     */
+    public function getBodyStream()
+    {
+        $stream = fopen('php://temp/maxmemory:2097152', 'w+b');
+        if ($stream === false) {
+            throw new \RuntimeException('Cannot allocate request stream');
+        }
+        $body = $this->getBody();
+        $offset = 0;
+        while ($offset < strlen($body)) {
+            $written = fwrite($stream, substr($body, $offset, 65536));
+            if ($written === false || $written === 0) {
+                fclose($stream);
+                throw new \RuntimeException('Cannot spool request body');
+            }
+            $offset += $written;
+        }
+        rewind($stream);
+        return $stream;
     }
 
     public function getBucket(): string

@@ -124,6 +124,26 @@ Run `php cleanup_multipart.php` periodically (e.g. via crontab) to clean up aban
 0 3 * * * /usr/bin/php /path/to/simple-php-s3-server/cleanup_multipart.php
 ```
 
+## Testing
+
+The test suite uses PHPUnit 11 and requires PHP 8.2 or later, with the extensions
+required by Composer plus SimpleXML and Fileinfo. Install development dependencies
+and run the suite from the project directory:
+
+```sh
+composer install
+php vendor/bin/phpunit
+```
+
+The suite covers authentication, request parsing, S3 controllers, XML responses,
+filesystem storage, and the storage interface, including stream ownership and
+nonseekable downloads. It uses temporary storage and requires no live S3 or IMAP
+server. Webserver routing and HTTP behavior should also be verified separately
+against a dedicated test deployment using an S3 client.
+
+See [Storage backends](docs/STORAGE_BACKENDS.md) for backend configuration and
+stream contracts.
+
 ## Known Limitations
 
 ### MinIO Client Not Supported

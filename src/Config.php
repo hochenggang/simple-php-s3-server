@@ -18,7 +18,7 @@ class Config
         self::$config = [];
         self::$accessKeys = [];
 
-        $iniFile = Path::join(dirname(__DIR__, 2), 'config.ini');
+        $iniFile = getenv('S3_CONFIG') ?: Path::join(dirname(__DIR__, 2), 'config.ini');
         if (file_exists($iniFile)) {
             $iniContent = parse_ini_file($iniFile, true);
             if ($iniContent !== false) {

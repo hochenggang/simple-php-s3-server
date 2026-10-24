@@ -6,19 +6,21 @@ use S3Gateway\Config;
 use S3Gateway\Exception\S3Exception;
 use S3Gateway\Http\Request;
 use S3Gateway\Http\Response;
-use S3Gateway\Storage\FileStorage;
+use S3Gateway\Storage\Storage;
+use S3Gateway\Storage\MultipartStorage;
 
 class MultipartController
 {
-    private FileStorage $storage;
+    private Storage $storage;
 
-    public function __construct(FileStorage $storage)
+    public function __construct(Storage $storage)
     {
         $this->storage = $storage;
     }
 
     public function createMultipartUpload(Request $request, Response $response): void
     {
+        $multipart = $this->multipart();
         $bucket = $request->getBucket();
         $key = $request->getKey();
 
@@ -36,7 +38,7 @@ class MultipartController
 
         $uploadId = bin2hex(random_bytes(16));
 
-        if (!$this->storage->createMultipartUpload($bucket, $uploadId)) {
+        if (!$multipart->createMultipartUpload($bucket, $uploadId)) {
             throw S3Exception::internalError('Failed to create multipart upload', "/{$bucket}/{$key}");
         }
 
@@ -50,6 +52,7 @@ class MultipartController
 
     public function uploadPart(Request $request, Response $response): void
     {
+        $multipart = $this->multipart();
         $bucket = $request->getBucket();
         $key = $request->getKey();
         $uploadId = $request->getQueryParam('uploadId');
@@ -67,21 +70,18 @@ class MultipartController
             throw S3Exception::invalidRequest('Invalid partNumber (must be 1-10000)');
         }
 
-        $uploadDir = $this->storage->getPathResolver()->multipartPath($bucket, $uploadId);
-
-        if (!file_exists($uploadDir)) {
+        if (!$multipart->multipartUploadExists($bucket, $uploadId)) {
             throw S3Exception::noSuchUpload("/{$bucket}/{$key}");
         }
 
-        $body = $request->getBody();
-
-        if (!$this->storage->savePart($bucket, $uploadId, $partNumber, $body)) {
-            throw S3Exception::internalError('Failed to write part file', "/{$bucket}/{$key}");
+        $input = $request->getBodyStream();
+        try {
+            $partMeta = $multipart->savePartFromStream($bucket, $uploadId, $partNumber, $input);
+        } finally {
+            fclose($input);
         }
-
-        $partMeta = $this->storage->getMetaReader()->getPartMeta($bucket, $uploadId, $partNumber);
         if ($partMeta === null) {
-            throw S3Exception::internalError('Failed to read part metadata', "/{$bucket}/{$key}");
+            throw S3Exception::internalError('Failed to store upload part', "/{$bucket}/{$key}");
         }
 
         $response
@@ -91,6 +91,7 @@ class MultipartController
 
     public function listParts(Request $request, Response $response): void
     {
+        $multipart = $this->multipart();
         $bucket = $request->getBucket();
         $key = $request->getKey();
         $uploadId = $request->getQueryParam('uploadId');
@@ -103,12 +104,11 @@ class MultipartController
             throw S3Exception::invalidRequest('uploadId required');
         }
 
-        $uploadDir = $this->storage->getPathResolver()->multipartPath($bucket, $uploadId);
-        if (!file_exists($uploadDir)) {
+        if (!$multipart->multipartUploadExists($bucket, $uploadId)) {
             throw S3Exception::noSuchUpload("/{$bucket}/{$key}");
         }
 
-        $parts = $this->storage->listParts($bucket, $uploadId);
+        $parts = $multipart->listParts($bucket, $uploadId);
         $xml = XmlResponse::listParts($bucket, $key, $uploadId, $parts);
 
         $response
@@ -119,6 +119,7 @@ class MultipartController
 
     public function completeMultipartUpload(Request $request, Response $response): void
     {
+        $multipart = $this->multipart();
         $bucket = $request->getBucket();
         $key = $request->getKey();
         $uploadId = $request->getQueryParam('uploadId');
@@ -131,8 +132,7 @@ class MultipartController
             throw S3Exception::invalidRequest('uploadId required');
         }
 
-        $uploadDir = $this->storage->getPathResolver()->multipartPath($bucket, $uploadId);
-        if (!file_exists($uploadDir)) {
+        if (!$multipart->multipartUploadExists($bucket, $uploadId)) {
             throw S3Exception::noSuchUpload("/{$bucket}/{$key}");
         }
 
@@ -163,12 +163,7 @@ class MultipartController
         }
 
         foreach (array_keys($parts) as $partNumber) {
-            $partPath = $this->storage->getPathResolver()->partPath($bucket, $uploadId, $partNumber);
-            if (!file_exists($partPath)) {
-                throw S3Exception::invalidPart("Part file missing: {$partNumber}", "/{$bucket}/{$key}");
-            }
-
-            $partMeta = $this->storage->getMetaReader()->getPartMeta($bucket, $uploadId, $partNumber);
+            $partMeta = $multipart->getPartMeta($bucket, $uploadId, $partNumber);
             if ($partMeta === null) {
                 throw S3Exception::invalidPart("Cannot read part metadata: {$partNumber}", "/{$bucket}/{$key}");
             }
@@ -178,7 +173,7 @@ class MultipartController
             }
         }
 
-        $result = $this->storage->completeMultipartUpload($bucket, $key, $uploadId, $parts);
+        $result = $multipart->completeMultipartUpload($bucket, $key, $uploadId, $parts);
         if ($result === null) {
             throw S3Exception::internalError('Failed to complete multipart upload', "/{$bucket}/{$key}");
         }
@@ -199,6 +194,7 @@ class MultipartController
 
     public function abortMultipartUpload(Request $request, Response $response): void
     {
+        $multipart = $this->multipart();
         $bucket = $request->getBucket();
         $key = $request->getKey();
         $uploadId = $request->getQueryParam('uploadId');
@@ -211,7 +207,15 @@ class MultipartController
             throw S3Exception::invalidRequest('uploadId required');
         }
 
-        $this->storage->abortMultipartUpload($bucket, $uploadId);
+        $multipart->abortMultipartUpload($bucket, $uploadId);
         $response->sendEmpty(204);
+    }
+
+    private function multipart(): MultipartStorage
+    {
+        if (!$this->storage instanceof MultipartStorage) {
+            throw new S3Exception('NotImplemented', 'This storage backend does not support multipart uploads', 501);
+        }
+        return $this->storage;
     }
 }

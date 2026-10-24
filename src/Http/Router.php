@@ -10,24 +10,25 @@ use S3Gateway\S3\BucketController;
 use S3Gateway\S3\ObjectController;
 use S3Gateway\S3\MultipartController;
 use S3Gateway\S3\XmlResponse;
-use S3Gateway\Storage\FileStorage;
+use S3Gateway\Storage\Storage;
+use S3Gateway\Storage\StorageFactory;
 
 class Router
 {
     private Request $request;
     private Response $response;
     private Authenticator $authenticator;
-    private FileStorage $storage;
+    private Storage $storage;
     private BucketController $bucketController;
     private ObjectController $objectController;
     private MultipartController $multipartController;
 
-    public function __construct()
+    public function __construct(?Storage $storage = null)
     {
         $this->request = new Request();
         $this->response = new Response();
         $this->authenticator = new Authenticator($this->request);
-        $this->storage = new FileStorage();
+        $this->storage = $storage ?? StorageFactory::create();
         $this->bucketController = new BucketController($this->storage);
         $this->objectController = new ObjectController($this->storage);
         $this->multipartController = new MultipartController($this->storage);

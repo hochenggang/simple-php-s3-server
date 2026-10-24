@@ -46,22 +46,22 @@ class ObjectControllerTest extends TestCase
 
         $request = $this->createRequest('GET', '/obj-bucket/file.txt');
 
-        // Spy that captures the options getObject hands to sendFile, instead of
+        // Spy that captures the options getObject hands to sendStream, instead of
         // emitting headers (headers_list() is unreliable in the CLI SAPI).
         $response = new class extends Response {
-            public ?string $capturedFile = null;
+            public ?string $capturedContent = null;
             public array $capturedOptions = [];
-            public function sendFile(string $filePath, array $options = []): void
+            public function sendStream($stream, int $length, array $options = []): void
             {
-                $this->capturedFile = $filePath;
+                $this->capturedContent = stream_get_contents($stream, $length);
                 $this->capturedOptions = $options;
             }
         };
 
         $this->controller->getObject($request, $response);
 
-        $this->assertNotNull($response->capturedFile);
-        $this->assertEquals('hello world', file_get_contents($response->capturedFile));
+        $this->assertNotNull($response->capturedContent);
+        $this->assertEquals('hello world', $response->capturedContent);
 
         // GET must pass through the same metadata HEAD exposes.
         $this->assertNotEmpty($response->capturedOptions['etag']);
@@ -81,6 +81,37 @@ class ObjectControllerTest extends TestCase
 
         $this->expectException(S3Exception::class);
         $this->controller->getObject($request, $response);
+    }
+
+    public function testHeadPreservesEmptyLengthThroughApacheWithoutSendingBody(): void
+    {
+        $this->storage->createBucket('head-bucket');
+        foreach (['empty' => '', 'nonempty' => 'hello'] as $key => $body) {
+            $this->storage->putObjectFromString('head-bucket', $key, $body);
+            $response = new class extends Response {
+                public array $capturedHeaders = [];
+                public int $status = 0;
+                public function setHeader(string $name, string $value): self
+                {
+                    $this->capturedHeaders[$name] = $value;
+                    return $this;
+                }
+                public function sendEmpty(int $statusCode = 204): void
+                {
+                    $this->status = $statusCode;
+                }
+            };
+            ob_start();
+            try {
+                $this->controller->headObject($this->createRequest('HEAD', '/head-bucket/' . $key), $response);
+            } finally {
+                $output = ob_get_clean();
+            }
+            self::assertSame('', $output);
+            self::assertSame(200, $response->status);
+            self::assertSame($body === '' ? '00' : '5', $response->capturedHeaders['Content-Length']);
+            self::assertSame(strlen($body), (int)$response->capturedHeaders['Content-Length']);
+        }
     }
 
     public function testGetObjectOnMissingKeyReturnsNoSuchKey(): void

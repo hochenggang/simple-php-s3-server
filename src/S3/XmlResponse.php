@@ -32,11 +32,11 @@ class XmlResponse
         ], 'Error', false);
     }
 
-    public static function listBuckets(array $buckets, string $dataDir): string
+    public static function listBuckets(array $buckets, array $creationTimes): string
     {
         $bucketNodes = [];
         foreach ($buckets as $bucket) {
-            $creationDate = gmdate('Y-m-d\TH:i:s.000\Z', @filemtime($dataDir . '/' . $bucket) ?: time());
+            $creationDate = gmdate('Y-m-d\TH:i:s.000\Z', $creationTimes[$bucket] ?? time());
             $bucketNodes[] = [
                 'Name' => $bucket,
                 'CreationDate' => $creationDate,
