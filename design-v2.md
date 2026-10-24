@@ -57,7 +57,7 @@ HTTP 请求
 
 > `max-keys` 上限由 `MAX_KEYS` 配置（默认 100000）；`continuation-token` 采用 URL-safe base64(`lastKey`) 编码。
 
-> **结果缓存**：为缓解大 bucket 全量扫描的磁盘压力，将完整扫描结果缓存于 `./tmp/listbuckets/{bucket}.json`。格式为 JSON 数组，每元素为 `[key, size, mtime, etag]` 四元组（紧凑存储，避免字段名冗余）。若缓存文件存在且年龄（按文件 mtime 判断）小于 `LIST_BUCKETS_CACHE_TIMEOUT`（默认 60 秒），直接载入并在内存中执行 prefix 过滤、delimiter 分组与分页；否则重新扫描文件系统并更新缓存。带分页参数（marker / continuation-token / max-keys / delimiter / prefix）的请求同样走缓存，复用同一份完整扫描结果。写入/删除对象后最多在 TTL 内可能返回旧列表（弱一致性）。
+> **结果缓存**：为缓解大 bucket 全量扫描的磁盘压力，将完整扫描结果缓存于 `{DATA_DIR}/.cache/listobjects/{bucket}.json`。格式为 JSON 对象 `{"generation": ..., "rows": [...]}`，每行为 `[key, size, mtime, etag]` 四元组（紧凑存储，避免字段名冗余）。若缓存文件存在且年龄（按文件 mtime 判断）小于 `LIST_BUCKETS_CACHE_TIMEOUT`（默认 60 秒），直接载入并在内存中执行 prefix 过滤、delimiter 分组与分页；否则重新扫描文件系统并更新缓存。带分页参数（marker / continuation-token / max-keys / delimiter / prefix）的请求同样走缓存，复用同一份完整扫描结果。通过存储层的每次写入（上传、复制、删除、分片合并、创建与删除 bucket）都会替换 `{bucket}.gen` 中的代际标记；在旧代际下生成的缓存会被忽略，因此列表立即反映写入结果（与 S3 一致）。只有绕过网关、直接在磁盘上进行的修改，才可能在 TTL 内不可见。
 
 > **已知限制**：缓存未命中时仍递归扫描整个 bucket 目录后排序分页。后续可按纯文件系统特性进一步优化：prefix 命中真实子目录时直接进入该子目录扫描（目录收敛）；使用 delimiter 时只扫描到该层级（提前截断）；利用目录项字典序对 marker 做目录内二分定位。
 
@@ -119,7 +119,7 @@ HTTP 请求
 | Bucket | `{dataDir}/{bucket}` |
 | Object | `{dataDir}/{bucket}/{key}` （key 中的 `/` 映射为目录层级） |
 | Multipart Parts | `{dataDir}/{bucket}/.multipart/{uploadId}/{partNumber}` |
-| List 扫描结果缓存 | `{project}/tmp/listbuckets/{bucket}.json`（JSON 数组，每元素 `[key, size, mtime, etag]`） |
+| List 扫描结果缓存 | `{DATA_DIR}/.cache/listobjects/{bucket}.json`（代际标记加 `[key, size, mtime, etag]` 行）及 `{bucket}.gen` |
 
 约定：
 

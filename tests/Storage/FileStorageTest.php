@@ -75,12 +75,8 @@ class FileStorageTest extends TestCase
         // First call: scans filesystem and writes cache
         $result1 = $this->storage->listObjects('cache-bucket', '', 1000);
 
-        $cacheFile = \Symfony\Component\Filesystem\Path::join(
-            dirname(__DIR__, 2),
-            'tmp',
-            'listbuckets',
-            'cache-bucket.json'
-        );
+        // The cache lives under DATA_DIR, not in the application directory.
+        $cacheFile = $this->testDir . '/.cache/listobjects/cache-bucket.json';
         $this->assertFileExists($cacheFile);
 
         // Second call: hits cache, same result
@@ -88,8 +84,87 @@ class FileStorageTest extends TestCase
 
         $this->assertEquals(count($result1['objects']), count($result2['objects']));
         $this->assertEquals(2, count($result2['objects']));
+    }
 
-        @unlink($cacheFile);
+    /** @return list<string> */
+    private function listedKeys(string $bucket): array
+    {
+        $keys = array_column($this->storage->listObjects($bucket, '', 1000)['objects'], 'key');
+        sort($keys);
+        return $keys;
+    }
+
+    public function testListObjectsCacheReflectsWritesImmediately(): void
+    {
+        $this->setConfigValue('LIST_BUCKETS_CACHE_TIMEOUT', '60');
+        $this->createTestBucket('fresh-bucket');
+        $this->createTestObject('fresh-bucket', 'a.txt');
+        $this->assertSame(['a.txt'], $this->listedKeys('fresh-bucket'));
+
+        $this->createTestObject('fresh-bucket', 'b.txt');
+        $this->assertSame(['a.txt', 'b.txt'], $this->listedKeys('fresh-bucket'));
+
+        $this->storage->copyObject('fresh-bucket', 'a.txt', 'fresh-bucket', 'c.txt');
+        $this->assertSame(['a.txt', 'b.txt', 'c.txt'], $this->listedKeys('fresh-bucket'));
+
+        $this->storage->deleteObject('fresh-bucket', 'b.txt');
+        $this->assertSame(['a.txt', 'c.txt'], $this->listedKeys('fresh-bucket'));
+
+        $uploadId = bin2hex(random_bytes(16));
+        $this->storage->createMultipartUpload('fresh-bucket', $uploadId);
+        $this->storage->savePart('fresh-bucket', $uploadId, 1, 'part');
+        $this->storage->completeMultipartUpload('fresh-bucket', 'd.txt', $uploadId, [1 => true]);
+        $this->assertSame(['a.txt', 'c.txt', 'd.txt'], $this->listedKeys('fresh-bucket'));
+    }
+
+    public function testListObjectsCacheInvalidatedForCopyDestinationBucket(): void
+    {
+        $this->setConfigValue('LIST_BUCKETS_CACHE_TIMEOUT', '60');
+        $this->createTestBucket('src-bucket');
+        $this->createTestBucket('dst-bucket');
+        $this->createTestObject('src-bucket', 'a.txt');
+        $this->assertSame([], $this->listedKeys('dst-bucket'));
+
+        $this->storage->copyObject('src-bucket', 'a.txt', 'dst-bucket', 'a.txt');
+        $this->assertSame(['a.txt'], $this->listedKeys('dst-bucket'));
+    }
+
+    public function testRecreatedBucketDoesNotSeeOldListing(): void
+    {
+        $this->setConfigValue('LIST_BUCKETS_CACHE_TIMEOUT', '60');
+        $this->createTestBucket('reborn');
+        $this->createTestObject('reborn', 'old.txt');
+        $this->assertSame(['old.txt'], $this->listedKeys('reborn'));
+
+        $this->storage->deleteObject('reborn', 'old.txt');
+        $this->assertTrue($this->storage->deleteBucket('reborn'));
+        $this->createTestBucket('reborn');
+        $this->assertSame([], $this->listedKeys('reborn'));
+    }
+
+    public function testCacheBuiltUnderOlderGenerationIsIgnored(): void
+    {
+        // Simulates a listing whose scan raced with a write: its cache file
+        // carries the generation from before the write and must not be served.
+        $this->setConfigValue('LIST_BUCKETS_CACHE_TIMEOUT', '60');
+        $this->createTestBucket('race-bucket');
+        $this->createTestObject('race-bucket', 'a.txt');
+        $this->listedKeys('race-bucket');
+        $cacheFile = $this->testDir . '/.cache/listobjects/race-bucket.json';
+        $stale = file_get_contents($cacheFile);
+
+        $this->createTestObject('race-bucket', 'b.txt');
+        file_put_contents($cacheFile, $stale);
+        $this->assertSame(['a.txt', 'b.txt'], $this->listedKeys('race-bucket'));
+    }
+
+    public function testCacheDirectoryIsNotListedAsBucket(): void
+    {
+        $this->setConfigValue('LIST_BUCKETS_CACHE_TIMEOUT', '60');
+        $this->createTestBucket('only-bucket');
+        $this->listedKeys('only-bucket');
+        $this->assertDirectoryExists($this->testDir . '/.cache');
+        $this->assertSame(['only-bucket'], $this->storage->listBuckets());
     }
 
     public function testDeleteBucket(): void
@@ -370,9 +445,7 @@ class FileStorageTest extends TestCase
 
         $this->storage->listObjects('nocache-bucket');
 
-        $cacheFile = \Symfony\Component\Filesystem\Path::join(
-            dirname(__DIR__, 2), 'tmp', 'listbuckets', 'nocache-bucket.json'
-        );
+        $cacheFile = $this->testDir . '/.cache/listobjects/nocache-bucket.json';
         $this->assertFileDoesNotExist($cacheFile);
     }
 
@@ -386,10 +459,13 @@ class FileStorageTest extends TestCase
         $result1 = $this->storage->listObjects('stale-bucket');
         $this->assertCount(1, $result1['objects']);
 
-        // Write a new object directly to the filesystem, bypassing cache invalidation.
-        $this->createTestObject('stale-bucket', 'added-later.txt');
+        // Write a new object directly to the filesystem, bypassing the storage
+        // API and therefore cache invalidation (an out-of-band change).
+        file_put_contents($this->testDir . '/stale-bucket/added-later.txt', 'x');
 
-        // Second call within TTL must return the cached (stale) result.
+        // Second call within TTL returns the cached result: out-of-band
+        // changes appear only after the TTL. Writes through the storage API
+        // are visible at once (see testListObjectsCacheReflectsWritesImmediately).
         $result2 = $this->storage->listObjects('stale-bucket');
         $this->assertCount(1, $result2['objects'], 'Cache should return stale data within TTL');
 
@@ -405,17 +481,15 @@ class FileStorageTest extends TestCase
         // Populate cache.
         $this->storage->listObjects('ttl-bucket');
 
-        $cacheFile = \Symfony\Component\Filesystem\Path::join(
-            dirname(__DIR__, 2), 'tmp', 'listbuckets', 'ttl-bucket.json'
-        );
+        $cacheFile = $this->testDir . '/.cache/listobjects/ttl-bucket.json';
         $this->assertFileExists($cacheFile);
 
         // Backdate the cache file so it's older than the TTL.
         $oldTime = time() - 120;
         touch($cacheFile, $oldTime);
 
-        // Add a new object after the cache was populated.
-        $this->createTestObject('ttl-bucket', 'second.txt');
+        // Add a new object out of band after the cache was populated.
+        file_put_contents($this->testDir . '/ttl-bucket/second.txt', 'x');
 
         // Cache is expired -> should rescan and see both objects.
         $result = $this->storage->listObjects('ttl-bucket');
@@ -454,9 +528,7 @@ class FileStorageTest extends TestCase
 
     private function cleanupCacheFile(string $bucket): void
     {
-        $cacheFile = \Symfony\Component\Filesystem\Path::join(
-            dirname(__DIR__, 2), 'tmp', 'listbuckets', $bucket . '.json'
-        );
+        $cacheFile = $this->testDir . '/.cache/listobjects/' . $bucket . '.json';
         if (file_exists($cacheFile)) {
             @unlink($cacheFile);
         }

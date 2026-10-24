@@ -74,10 +74,13 @@ class FileStorage
         string $startAfter = '',
         string $marker = ''
     ): array {
-        $allFiles = $this->getScanCache($bucket);
+        // Read the generation before scanning: a write that lands during the
+        // scan bumps it, so a cache built from a stale scan is never served.
+        $generation = $this->cacheGeneration($bucket);
+        $allFiles = $this->getScanCache($bucket, $generation);
         if ($allFiles === null) {
             $allFiles = $this->scanFilesystem($bucket);
-            $this->setScanCache($bucket, $allFiles);
+            $this->setScanCache($bucket, $allFiles, $generation);
         }
 
         // prefix 过滤在内存中执行（缓存的是完整扫描结果）
@@ -200,10 +203,12 @@ class FileStorage
 
     /**
      * ListObjects 结果缓存：缓存完整扫描结果，分页请求复用同一份缓存。
-     * 格式 JSON 数组，每元素 [key, size, mtime, etag] 四元组（紧凑）。
+     * 格式 {"generation": "...", "rows": [[key, size, mtime, etag], ...]}。
      * TTL 由 LIST_BUCKETS_CACHE_TIMEOUT 配置（默认 60 秒），按文件 mtime 判断。
+     * Every write to a bucket replaces its generation token, so a cache built
+     * under an older generation is ignored and listings reflect writes at once.
      */
-    private function getScanCache(string $bucket): ?array
+    private function getScanCache(string $bucket, string $generation): ?array
     {
         $cacheFile = $this->scanCachePath($bucket);
         if (!file_exists($cacheFile)) {
@@ -219,12 +224,12 @@ class FileStorage
         }
 
         $data = json_decode((string)file_get_contents($cacheFile), true);
-        if (!is_array($data)) {
+        if (!is_array($data) || ($data['generation'] ?? null) !== $generation || !is_array($data['rows'] ?? null)) {
             return null;
         }
 
         $files = [];
-        foreach ($data as $row) {
+        foreach ($data['rows'] as $row) {
             $files[] = [
                 'key' => $row[0],
                 'size' => $row[1],
@@ -235,18 +240,10 @@ class FileStorage
         return $files;
     }
 
-    private function setScanCache(string $bucket, array $files): void
+    private function setScanCache(string $bucket, array $files, string $generation): void
     {
-        if (Config::listBucketsCacheTimeout() <= 0) {
+        if (Config::listBucketsCacheTimeout() <= 0 || !$this->ensureCacheDir()) {
             return;
-        }
-        $cacheFile = $this->scanCachePath($bucket);
-        $dir = dirname($cacheFile);
-        if (!is_dir($dir)) {
-            @mkdir($dir, 0755, true);
-            if (!is_dir($dir)) {
-                return;
-            }
         }
 
         $rows = [];
@@ -255,16 +252,63 @@ class FileStorage
         }
 
         // 原子写入：先写 .tmp 再 rename
-        $tmp = $cacheFile . '.tmp';
-        if (file_put_contents($tmp, json_encode($rows)) === false) {
+        $cacheFile = $this->scanCachePath($bucket);
+        $tmp = $cacheFile . '.' . bin2hex(random_bytes(4)) . '.tmp';
+        if (file_put_contents($tmp, json_encode(['generation' => $generation, 'rows' => $rows])) === false) {
+            @unlink($tmp);
             return;
         }
-        @rename($tmp, $cacheFile);
+        if (!@rename($tmp, $cacheFile)) {
+            @unlink($tmp);
+        }
+    }
+
+    /**
+     * Listing caches live under DATA_DIR, next to the data they describe and
+     * never inside the application directory. Bucket names cannot start with
+     * a dot, so the directory cannot collide with a bucket.
+     */
+    private function cacheDir(): string
+    {
+        return Path::join($this->pathResolver->getDataDir(), '.cache', 'listobjects');
+    }
+
+    private function ensureCacheDir(): bool
+    {
+        $dir = $this->cacheDir();
+        return is_dir($dir) || @mkdir($dir, 0700, true) || is_dir($dir);
     }
 
     private function scanCachePath(string $bucket): string
     {
-        return Path::join(dirname(__DIR__, 2), 'tmp', 'listbuckets', $bucket . '.json');
+        return Path::join($this->cacheDir(), $bucket . '.json');
+    }
+
+    private function generationPath(string $bucket): string
+    {
+        return Path::join($this->cacheDir(), $bucket . '.gen');
+    }
+
+    private function cacheGeneration(string $bucket): string
+    {
+        $path = $this->generationPath($bucket);
+        $generation = is_file($path) ? @file_get_contents($path) : false;
+        return $generation === false ? '' : $generation;
+    }
+
+    /** Invalidate cached listings of $bucket; call after every write to it. */
+    private function bumpCacheGeneration(string $bucket): void
+    {
+        if (!$this->ensureCacheDir()) {
+            return;
+        }
+        $path = $this->generationPath($bucket);
+        $tmp = $path . '.' . bin2hex(random_bytes(4)) . '.tmp';
+        if (@file_put_contents($tmp, bin2hex(random_bytes(16))) === false || !@rename($tmp, $path)) {
+            @unlink($tmp);
+            // Without a new generation the old cache could be served; drop it.
+            @unlink($this->scanCachePath($bucket));
+        }
     }
 
     /**
@@ -284,7 +328,12 @@ class FileStorage
         }
 
         $bucketPath = $this->pathResolver->bucketPath($bucket);
-        return $this->pathResolver->ensureDir($bucketPath);
+        if (!$this->pathResolver->ensureDir($bucketPath)) {
+            return false;
+        }
+        // A recreated bucket must not see a cached listing of its predecessor.
+        $this->bumpCacheGeneration($bucket);
+        return true;
     }
 
     public function deleteBucket(string $bucket): bool
@@ -306,7 +355,11 @@ class FileStorage
         $items = array_values(array_diff($items, ['.', '..', '.multipart']));
 
         // Only delete when no business entries remain.
-        return count($items) === 0 && @rmdir($bucketPath);
+        if (count($items) !== 0 || !@rmdir($bucketPath)) {
+            return false;
+        }
+        $this->bumpCacheGeneration($bucket);
+        return true;
     }
 
     public function bucketExists(string $bucket): bool
@@ -369,6 +422,7 @@ class FileStorage
             return false;
         }
 
+        $this->bumpCacheGeneration($bucket);
         return true;
     }
 
@@ -385,7 +439,11 @@ class FileStorage
             return false;
         }
 
-        return @copy($sourcePath, $destPath);
+        if (!@copy($sourcePath, $destPath)) {
+            return false;
+        }
+        $this->bumpCacheGeneration($destBucket);
+        return true;
     }
 
     public function deleteObject(string $bucket, string $key): bool
@@ -400,6 +458,7 @@ class FileStorage
 
         if ($result) {
             $this->cleanupEmptyDirectories($bucket, dirname($filePath));
+            $this->bumpCacheGeneration($bucket);
         }
 
         return $result;
@@ -558,6 +617,7 @@ class FileStorage
                 return null;
             }
 
+            $this->bumpCacheGeneration($bucket);
             $this->safeDeleteDirectory($uploadDir);
 
             $etag = $this->metaReader->calculateEtag($this->pathResolver->canonicalizeKey($key), $finalSize);

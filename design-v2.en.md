@@ -57,7 +57,7 @@ Exception handling is unified in the routing layer: business exceptions are conv
 
 > The `max-keys` upper bound is controlled by the `MAX_KEYS` config (default 100000); `continuation-token` uses URL-safe base64(`lastKey`) encoding.
 
-> **Result caching**: To alleviate disk pressure from full scans of large buckets, the complete scan result is cached at `./tmp/listbuckets/{bucket}.json`. The format is a JSON array where each element is a `[key, size, mtime, etag]` tuple (compact storage, avoiding field name redundancy). If the cache file exists and its age (judged by file mtime) is less than `LIST_BUCKETS_CACHE_TIMEOUT` (default 60 seconds), it is loaded directly and prefix filtering, delimiter grouping, and pagination are performed in memory; otherwise the filesystem is rescanned and the cache updated. Requests with pagination parameters (marker / continuation-token / max-keys / delimiter / prefix) also use the cache, reusing the same complete scan result. After writing/deleting objects, stale listings may be returned for up to the TTL (weak consistency).
+> **Result caching**: To alleviate disk pressure from full scans of large buckets, the complete scan result is cached at `{DATA_DIR}/.cache/listobjects/{bucket}.json`. The format is a JSON object `{"generation": ..., "rows": [...]}` where each row is a `[key, size, mtime, etag]` tuple (compact storage, avoiding field name redundancy). If the cache file exists and its age (judged by file mtime) is less than `LIST_BUCKETS_CACHE_TIMEOUT` (default 60 seconds), it is loaded directly and prefix filtering, delimiter grouping, and pagination are performed in memory; otherwise the filesystem is rescanned and the cache updated. Requests with pagination parameters (marker / continuation-token / max-keys / delimiter / prefix) also use the cache, reusing the same complete scan result. Every write through the storage layer (put, copy, delete, multipart completion, bucket creation and deletion) replaces the bucket's generation token in `{bucket}.gen`; a cache built under an older generation is ignored, so listings reflect writes immediately, as in S3. Only changes made directly on disk, bypassing the gateway, appear after up to the TTL.
 
 > **Known limitation**: On a cache miss, the entire bucket directory is still recursively scanned, sorted, and paginated. Future optimizations based on pure filesystem characteristics: when prefix matches a real subdirectory, scan only that subdirectory (directory convergence); when using a delimiter, scan only up to that level (early truncation); use directory entry lexicographic order for in-directory binary search of the marker.
 
@@ -119,7 +119,7 @@ The global upper bound is controlled by `MAX_UPLOAD_SIZE` config (default 8MB), 
 | Bucket | `{dataDir}/{bucket}` |
 | Object | `{dataDir}/{bucket}/{key}` (`/` in key maps to directory hierarchy) |
 | Multipart Parts | `{dataDir}/{bucket}/.multipart/{uploadId}/{partNumber}` |
-| List scan result cache | `{project}/tmp/listbuckets/{bucket}.json` (JSON array, each element `[key, size, mtime, etag]`) |
+| List scan result cache | `{DATA_DIR}/.cache/listobjects/{bucket}.json` (generation token plus rows `[key, size, mtime, etag]`) and `{bucket}.gen` |
 
 Conventions:
 
