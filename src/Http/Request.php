@@ -2,7 +2,9 @@
 
 namespace S3Gateway\Http;
 
+use S3Gateway\Auth\ChunkSignVerifier;
 use S3Gateway\Config;
+use S3Gateway\Exception\S3Exception;
 use S3Gateway\Logger;
 
 class Request
@@ -13,21 +15,36 @@ class Request
     private array $headers = [];
     /** @var array<string,string> lowercased header name => value, for O(1) lookup */
     private array $lowerHeaders = [];
-    /** @var string|null null = body not yet read; lazy to avoid loading php://input on size-check-then-reject paths */
-    private ?string $body = null;
     private string $bucket = '';
     private string $key = '';
     private array $queryParams = [];
 
-    public function __construct()
+    /** @var resource|null injected body source for tests; null reads php://input */
+    private $inputStream;
+    private ?BodySpool $spool = null;
+    private ?string $accessKeyId = null;
+    private ?string $claimedAccessKeyId = null;
+    /** @var string|null declared x-amz-content-sha256 armed by the Authenticator */
+    private ?string $declaredPayloadHash = null;
+    /** @var array{secret:string,amzDate:string,region:string,service:string,signature:string,trailer?:bool}|null */
+    private ?array $streamingPayloadCtx = null;
+
+    /**
+     * @param resource|null $inputStream body source override (tests); production
+     *                                   passes null and the body is read from
+     *                                   php://input exactly once, on demand.
+     */
+    public function __construct($inputStream = null)
     {
         $originalMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
         $this->method = $this->detectMethod($originalMethod);
         $this->uri = $this->parseUri();
         $this->queryString = $_SERVER['QUERY_STRING'] ?? '';
         $this->headers = $this->parseHeaders();
-        // body is read lazily on first getBody() call so that early size checks
-        // can reject oversized requests without first loading them into memory.
+        $this->inputStream = $inputStream;
+        // The body is never read eagerly: HEAD/GET/list requests never touch
+        // php://input, and uploads are spooled to disk-backed temp storage in
+        // bounded blocks instead of being loaded into a PHP string.
         $this->parsePath();
         $this->parseQueryParams();
     }
@@ -118,105 +135,16 @@ class Request
         return $headers;
     }
 
-    private function readBody(): string
-    {
-        if ($this->method === 'HEAD') {
-            return '';
-        }
-
-        $body = file_get_contents('php://input');
-
-        if ($body === false || $body === '') {
-            return '';
-        }
-
-        // Decide chunked decoding by headers, not by body content sniffing.
-        // Sniffing the body is unsafe: a binary PUT whose first bytes happen to
-        // look like a hex chunk size would be silently truncated.
-        $contentEncoding = $this->getHeader('Content-Encoding');
-        $transferEncoding = $this->getHeader('Transfer-Encoding');
-
-        if ($contentEncoding !== null && stripos($contentEncoding, 'aws-chunked') !== false) {
-            return $this->decodeAwsChunked($body);
-        }
-
-        if ($transferEncoding !== null && stripos($transferEncoding, 'chunked') !== false) {
-            return $this->decodeChunked($body);
-        }
-
-        return $body;
-    }
-
-    private function decodeChunked(string $body): string
-    {
-        $decoded = '';
-        $pos = 0;
-        $len = strlen($body);
-
-        while ($pos < $len) {
-            $lineEnd = strpos($body, "\r\n", $pos);
-            if ($lineEnd === false) {
-                break;
-            }
-
-            $size = hexdec(trim(substr($body, $pos, $lineEnd - $pos)));
-            if ($size === 0) {
-                break;
-            }
-
-            $dataStart = $lineEnd + 2;
-            if ($dataStart + $size > $len) {
-                break;
-            }
-
-            $decoded .= substr($body, $dataStart, $size);
-            $pos = $dataStart + $size + 2;
-        }
-
-        return $decoded;
-    }
-
-    /**
-     * Decode AWS chunked encoding: hex(size);chunk-signature=signature\r\n data\r\n
-     */
-    private function decodeAwsChunked(string $body): string
-    {
-        $decoded = '';
-        $pos = 0;
-        $len = strlen($body);
-
-        while ($pos < $len) {
-            $lineEnd = strpos($body, "\r\n", $pos);
-            if ($lineEnd === false) {
-                break;
-            }
-
-            $chunkHeader = substr($body, $pos, $lineEnd - $pos);
-            $semicolonPos = strpos($chunkHeader, ';');
-            $sizeHex = $semicolonPos !== false
-                ? trim(substr($chunkHeader, 0, $semicolonPos))
-                : trim($chunkHeader);
-
-            $size = hexdec($sizeHex);
-            if ($size === 0) {
-                break;
-            }
-
-            $dataStart = $lineEnd + 2;
-            if ($dataStart + $size > $len) {
-                break;
-            }
-
-            $decoded .= substr($body, $dataStart, $size);
-            $pos = $dataStart + $size + 2;
-        }
-
-        return $decoded;
-    }
-
     private function parsePath(): void
     {
-        $path = trim($this->uri, '/');
+        $path = $this->uri;
+        // Route relative to the front controller, but retain the full URI for
+        // SigV4: clients sign the deployment prefix as part of the request path.
+        $base = rtrim(dirname($_SERVER['SCRIPT_NAME'] ?? '/index.php'), '/');
+        if ($base !== '' && str_starts_with($base, '/') && str_starts_with($path, $base . '/')) {
+            $path = substr($path, strlen($base));
+        }
+        $path = trim($path, '/');
         $parts = explode('/', $path, 2);
 
         $this->bucket = $parts[0] ?? '';
@@ -230,6 +158,218 @@ class Request
     {
         parse_str($this->queryString, $this->queryParams);
     }
+
+    // ─── Body pipeline ────────────────────────────────────────────────
+
+    /**
+     * aws-chunked framing is implied by any STREAMING-* x-amz-content-sha256,
+     * like S3 does: keying it on Content-Encoding alone would let a request
+     * that omits (or strips an unsigned) Content-Encoding skip chunk
+     * signature verification and store raw framing as the object.
+     */
+    public function isAwsChunked(): bool
+    {
+        $declared = $this->getHeader('X-Amz-Content-Sha256');
+        if ($declared !== null && str_starts_with($declared, 'STREAMING-')) {
+            return true;
+        }
+        $contentEncoding = $this->getHeader('Content-Encoding');
+        return $contentEncoding !== null && stripos($contentEncoding, 'aws-chunked') !== false;
+    }
+
+    /**
+     * X-Amz-Decoded-Content-Length sent by SDKs for aws-chunked uploads:
+     * the exact size of the decoded payload, usable for size checks that must
+     * not count framing/checksum overhead.
+     */
+    public function getDecodedLengthHint(): ?int
+    {
+        $value = $this->getHeader('X-Amz-Decoded-Content-Length');
+        if ($value === null || preg_match('/^\d+$/', $value) !== 1) {
+            return null;
+        }
+        return (int)$value;
+    }
+
+    public function setAccessKeyId(string $accessKeyId): void
+    {
+        $this->accessKeyId = $accessKeyId;
+    }
+
+    public function getAccessKeyId(): ?string
+    {
+        return $this->accessKeyId;
+    }
+
+    /**
+     * Access key named by the request's credential, before its signature is
+     * checked. Used only to select the body limit when the legacy hash-less
+     * SigV4 path must spool during signature calculation; never treated as
+     * authenticated.
+     */
+    public function setClaimedAccessKeyId(string $accessKeyId): void
+    {
+        $this->claimedAccessKeyId = $accessKeyId;
+    }
+
+    /**
+     * Arm payload verification after successful authentication. Called by
+     * the Authenticator once the signature over the headers matched.
+     *
+     * @param string|null $declared         x-amz-content-sha256 header value
+     * @param array|null  $streamingCtx     secret/date/region/service/request
+     *                                      signature for signed streaming chunks
+     */
+    public function armPayloadVerification(?string $declared, ?array $streamingCtx = null): void
+    {
+        $this->declaredPayloadHash = $declared;
+        $this->streamingPayloadCtx = $streamingCtx;
+        // The legacy hash-less path may already have spooled the body before
+        // arming; verify immediately in that case.
+        if ($this->spool !== null) {
+            $this->verifyDeclaredPayloadHash();
+        }
+    }
+
+    /**
+     * Size limit applicable to this request's body: per-key override when
+     * the authenticated key defines one, else global MAX_UPLOAD_SIZE.
+     * 0 disables the limit.
+     */
+    public function maxBodyBytes(): ?int
+    {
+        $max = 0;
+        $keyId = $this->accessKeyId ?? $this->claimedAccessKeyId;
+        if ($keyId !== null) {
+            $max = Config::getFileMaxSize($keyId);
+        }
+        if ($max <= 0) {
+            $max = Config::maxUploadSize();
+        }
+        return $max > 0 ? $max : null;
+    }
+
+    /**
+     * Read and spool the body under its effective limit. Methods without a
+     * request body are skipped. This is the authoritative enforcement point
+     * for upload size: decoded bytes are counted while streaming, and the
+     * read aborts as soon as the limit is exceeded.
+     */
+    public function enforceBodyLimit(): void
+    {
+        if (in_array($this->method, ['GET', 'HEAD', 'DELETE', 'OPTIONS'], true)) {
+            return;
+        }
+        $this->ensureSpooled();
+    }
+
+    public function spoolSize(): ?int
+    {
+        return $this->spool?->getSize();
+    }
+
+    private function ensureSpooled(): BodySpool
+    {
+        if ($this->spool !== null) {
+            return $this->spool;
+        }
+
+        if ($this->method === 'HEAD') {
+            $input = self::emptyStream();
+            $mode = BodySpool::MODE_PLAIN;
+        } else {
+            $input = $this->inputStream ?? $this->openInputStream();
+            // Transfer-Encoding: chunked is already decoded by the SAPI.
+            $mode = $this->isAwsChunked() ? BodySpool::MODE_AWS_CHUNKED : BodySpool::MODE_PLAIN;
+        }
+
+        $verifier = null;
+        $chunkSigner = null;
+        if ($this->streamingPayloadCtx !== null) {
+            $chunkSigner = new ChunkSignVerifier(
+                $this->streamingPayloadCtx['secret'],
+                $this->streamingPayloadCtx['amzDate'],
+                $this->streamingPayloadCtx['region'],
+                $this->streamingPayloadCtx['service'],
+                $this->streamingPayloadCtx['signature']
+            );
+            $verifier = static function (string $dataHashHex, ?string $signatureHex) use ($chunkSigner): void {
+                $chunkSigner->verify($dataHashHex, $signatureHex ?? '');
+            };
+        }
+
+        $spool = BodySpool::create($input, $mode, $this->maxBodyBytes(), $verifier);
+        $trailers = $spool->getTrailers();
+        if ($chunkSigner !== null && ($this->streamingPayloadCtx['trailer'] ?? false)) {
+            $signature = $trailers['x-amz-trailer-signature'] ?? '';
+            unset($trailers['x-amz-trailer-signature']);
+            $chunkSigner->verifyTrailer($trailers, $signature);
+        }
+        $this->requireDeclaredTrailers($trailers);
+        $spool->verifyChecksumTrailers();
+        $this->spool = $spool;
+        $this->verifyDeclaredPayloadHash();
+        return $this->spool;
+    }
+
+    /**
+     * Checksum trailers announced in x-amz-trailer must actually arrive;
+     * otherwise a client (or a truncating intermediary) could drop the
+     * checksum and have the body accepted unverified.
+     *
+     * @param array<string,string> $trailers
+     */
+    private function requireDeclaredTrailers(array $trailers): void
+    {
+        $announced = $this->getHeader('X-Amz-Trailer');
+        if ($announced === null || !$this->isAwsChunked()) {
+            return;
+        }
+        foreach (explode(',', $announced) as $name) {
+            $name = strtolower(trim($name));
+            if (str_starts_with($name, 'x-amz-checksum-') && !isset($trailers[$name])) {
+                throw S3Exception::invalidRequest("Missing announced trailer {$name}");
+            }
+        }
+    }
+
+    private function verifyDeclaredPayloadHash(): void
+    {
+        $declared = $this->declaredPayloadHash;
+        if ($declared === null || $this->spool === null) {
+            return;
+        }
+        // Streaming/unsigned placeholders are not content hashes. Signed
+        // streaming was verified chunk by chunk during spooling.
+        if (preg_match('/^[a-fA-F0-9]{64}$/', $declared) !== 1) {
+            return;
+        }
+        if (!hash_equals($declared, $this->spool->getSha256())) {
+            throw S3Exception::xAmzContentSha256Mismatch();
+        }
+    }
+
+    /** @return resource */
+    private function openInputStream()
+    {
+        $input = fopen('php://input', 'rb');
+        if ($input === false) {
+            return self::emptyStream();
+        }
+        return $input;
+    }
+
+    /** @return resource */
+    private static function emptyStream()
+    {
+        $stream = fopen('php://memory', 'r+b');
+        if ($stream === false) {
+            throw new \RuntimeException('Cannot allocate empty stream');
+        }
+        return $stream;
+    }
+
+    // ─── Public accessors ─────────────────────────────────────────────
 
     public function getMethod(): string
     {
@@ -257,12 +397,46 @@ class Request
         return $this->headers;
     }
 
+    /**
+     * Decoded request body as a string. Only intended for the small XML
+     * request bodies (Delete, CompleteMultipartUpload) and legacy signature
+     * fallbacks; upload endpoints use getBodyStream(). The result is bounded
+     * by the configured upload limit.
+     */
     public function getBody(): string
     {
-        // Lazy read: php://input is only opened on first getBody() call, so
-        // HEAD/GET/list requests never touch the request body, and an early
-        // size-check in Router can reject oversized PUTs before they load.
-        return $this->body ??= $this->readBody();
+        if ($this->method === 'HEAD') {
+            return '';
+        }
+        $stream = $this->ensureSpooled()->getStream();
+        rewind($stream);
+        $data = stream_get_contents($stream);
+        return $data === false ? '' : $data;
+    }
+
+    /**
+     * Readable stream of the decoded request body, rewound to position 0.
+     * The Request owns the stream and closes it implicitly at request end;
+     * callers must read but must not fclose it. Repeat calls return the
+     * stream again from position 0.
+     */
+    public function getBodyStream()
+    {
+        $stream = $this->ensureSpooled()->getStream();
+        rewind($stream);
+        return $stream;
+    }
+
+    /** SHA-256 hex over the decoded body (spools if needed). */
+    public function getPayloadSha256(): string
+    {
+        return $this->ensureSpooled()->getSha256();
+    }
+
+    /** @return array<string,string> request trailers, lowercased names */
+    public function getTrailers(): array
+    {
+        return $this->ensureSpooled()->getTrailers();
     }
 
     public function getBucket(): string

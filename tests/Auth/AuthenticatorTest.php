@@ -29,7 +29,7 @@ class AuthenticatorTest extends TestCase
         s3gw_test_unset_env('BEARER_TOKEN');
     }
 
-    private function createRequest(array $serverVars): Request
+    private function createRequest(array $serverVars, mixed $body = null): Request
     {
         // Start from a clean baseline so headers/QUERY_STRING from previous
         // tests don't leak into the current one. Only keep essential CGI vars.
@@ -38,6 +38,15 @@ class AuthenticatorTest extends TestCase
             'REQUEST_URI' => '/',
             'QUERY_STRING' => '',
         ], $serverVars);
+        if (is_resource($body)) {
+            return new Request($body);
+        }
+        if (is_string($body) && $body !== '') {
+            $input = fopen('php://temp/maxmemory:2097152', 'w+b');
+            fwrite($input, $body);
+            rewind($input);
+            return new Request($input);
+        }
         return new Request();
     }
 
@@ -45,7 +54,7 @@ class AuthenticatorTest extends TestCase
      * Inject an access key into Config's static cache for tests that need to
      * progress past the access-key lookup step in authenticate().
      */
-    private function injectAccessKey(string $accessKeyId, string $secretKey, array $allowedBuckets = ['*']): void
+    private function injectAccessKey(string $accessKeyId, string $secretKey, array $allowedBuckets = ['*'], int $fileMaxSize = 0): void
     {
         $ref = new \ReflectionClass(\S3Gateway\Config::class);
         $keysProp = $ref->getProperty('accessKeys');
@@ -53,12 +62,248 @@ class AuthenticatorTest extends TestCase
         $current[$accessKeyId] = [
             'secret_key' => $secretKey,
             'allowed_buckets' => $allowedBuckets,
-            'file_max_size' => 0,
+            'file_max_size' => $fileMaxSize,
         ];
         $keysProp->setValue(null, $current);
     }
 
     // ─── No Authorization Header ─────────────────────────────────────
+
+    /**
+     * Produce a valid SigV4 signature for the exact request described by the
+     * given header values (minimal canonical set: host, content hash, date).
+     */
+    private function signPutRequest(string $secret, string $amzDate, string $payloadHash): string
+    {
+        $canonicalRequest = implode("\n", [
+            'PUT',
+            '/bucket/key',
+            '',
+            "host:example.local\nx-amz-content-sha256:{$payloadHash}\nx-amz-date:{$amzDate}",
+            '',
+            'host;x-amz-content-sha256;x-amz-date',
+            $payloadHash,
+        ]);
+        $date = substr($amzDate, 0, 8);
+        $scope = "{$date}/us-east-1/s3/aws4_request";
+        $stringToSign = implode("\n", [
+            'AWS4-HMAC-SHA256',
+            $amzDate,
+            $scope,
+            hash('sha256', $canonicalRequest),
+        ]);
+        $kDate = hash_hmac('sha256', $date, 'AWS4' . $secret, true);
+        $kRegion = hash_hmac('sha256', 'us-east-1', $kDate, true);
+        $kService = hash_hmac('sha256', 's3', $kRegion, true);
+        $kSigning = hash_hmac('sha256', 'aws4_request', $kService, true);
+        return hash_hmac('sha256', $stringToSign, $kSigning);
+    }
+
+    private function signedPutRequest(string $secret, string $payloadHash, string $body): Request
+    {
+        $amzDate = gmdate('Ymd\THis\Z');
+        $signature = $this->signPutRequest($secret, $amzDate, $payloadHash);
+        return $this->createRequest([
+            'REQUEST_METHOD' => 'PUT',
+            'REQUEST_URI' => '/bucket/key',
+            'HTTP_HOST' => 'example.local',
+            'HTTP_X_AMZ_DATE' => $amzDate,
+            'HTTP_X_AMZ_CONTENT_SHA256' => $payloadHash,
+            'HTTP_AUTHORIZATION' => 'AWS4-HMAC-SHA256 Credential=ak/' . substr($amzDate, 0, 8) . '/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=' . $signature,
+        ], $body);
+    }
+
+    public function testValidSignatureArmsAndPassesPayloadHash(): void
+    {
+        $this->injectAccessKey('ak', 'secret');
+        $body = 'verified-body';
+        $request = $this->signedPutRequest('secret', hash('sha256', $body), $body);
+
+        $auth = new Authenticator($request);
+        $this->assertSame('ak', $auth->authenticate());
+
+        // Authentication alone must not have read the body.
+        $request->enforceBodyLimit();
+        $this->assertSame($body, stream_get_contents($request->getBodyStream()));
+    }
+
+    public function testValidSignatureWithMismatchedPayloadHashRejectedAtSpool(): void
+    {
+        $this->injectAccessKey('ak', 'secret');
+        // The signature legitimately covers the declared hash; the body sent
+        // afterwards differs. Integrity fails when the spool computes it.
+        $request = $this->signedPutRequest('secret', hash('sha256', 'declared-body'), 'tampered-body');
+
+        $auth = new Authenticator($request);
+        $this->assertSame('ak', $auth->authenticate());
+
+        $this->expectException(S3Exception::class);
+        try {
+            $request->enforceBodyLimit();
+        } catch (S3Exception $e) {
+            $this->assertSame('XAmzContentSHA256Mismatch', $e->getS3Code());
+            throw $e;
+        }
+    }
+
+    /**
+     * Signed-streaming PUT without Content-Encoding: the chunk chain is
+     * seeded by the real request signature and must still be verified.
+     */
+    private function signedStreamingPutRequest(string $secret, array $chunks, bool $tamper = false): Request
+    {
+        $mode = 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD';
+        $amzDate = gmdate('Ymd\THis\Z');
+        $date = substr($amzDate, 0, 8);
+        $signature = $this->signPutRequest($secret, $amzDate, $mode);
+
+        $kDate = hash_hmac('sha256', $date, 'AWS4' . $secret, true);
+        $kRegion = hash_hmac('sha256', 'us-east-1', $kDate, true);
+        $kService = hash_hmac('sha256', 's3', $kRegion, true);
+        $kSigning = hash_hmac('sha256', 'aws4_request', $kService, true);
+        $previous = $signature;
+        $wire = '';
+        foreach ([...$chunks, ''] as $chunk) {
+            $previous = hash_hmac('sha256', implode("\n", [
+                'AWS4-HMAC-SHA256-PAYLOAD', $amzDate, "{$date}/us-east-1/s3/aws4_request",
+                $previous, hash('sha256', ''), hash('sha256', $chunk),
+            ]), $kSigning);
+            $sent = $tamper && $chunk !== '' ? strrev($chunk) : $chunk;
+            $wire .= dechex(strlen($sent)) . ';chunk-signature=' . $previous . "\r\n" . ($sent === '' ? '' : $sent . "\r\n");
+        }
+        $wire .= "\r\n";
+
+        return $this->createRequest([
+            'REQUEST_METHOD' => 'PUT',
+            'REQUEST_URI' => '/bucket/key',
+            'HTTP_HOST' => 'example.local',
+            'HTTP_X_AMZ_DATE' => $amzDate,
+            'HTTP_X_AMZ_CONTENT_SHA256' => $mode,
+            'HTTP_AUTHORIZATION' => 'AWS4-HMAC-SHA256 Credential=ak/' . $date . '/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=' . $signature,
+        ], $wire);
+    }
+
+    public function testSignedStreamingWithoutContentEncodingIsDecodedAndVerified(): void
+    {
+        $this->injectAccessKey('ak', 'secret');
+        $request = $this->signedStreamingPutRequest('secret', ['abc', 'defg']);
+        $auth = new Authenticator($request);
+        $this->assertSame('ak', $auth->authenticate());
+        $auth->checkRequestSize('ak');
+        $this->assertSame('abcdefg', $request->getBody());
+    }
+
+    public function testSignedStreamingWithoutContentEncodingTamperRejected(): void
+    {
+        $this->injectAccessKey('ak', 'secret');
+        $request = $this->signedStreamingPutRequest('secret', ['abc', 'defg'], true);
+        $auth = new Authenticator($request);
+        $this->assertSame('ak', $auth->authenticate());
+        $this->expectException(S3Exception::class);
+        try {
+            $auth->checkRequestSize('ak');
+        } catch (S3Exception $e) {
+            $this->assertSame('SignatureDoesNotMatch', $e->getS3Code());
+            throw $e;
+        }
+    }
+
+    public function testUnsupportedStreamingModeRejected(): void
+    {
+        $this->injectAccessKey('ak', 'secret');
+        $request = $this->signedPutRequest('secret', 'STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD', "0\r\n\r\n");
+        $this->expectException(S3Exception::class);
+        try {
+            (new Authenticator($request))->authenticate();
+        } catch (S3Exception $e) {
+            $this->assertSame('InvalidRequest', $e->getS3Code());
+            throw $e;
+        }
+    }
+
+    public function testHashlessV4SpoolsUnderPerKeyLimitBeforeSignatureCheck(): void
+    {
+        // Global limit disabled, per-key limit 50 bytes: the pre-auth spool
+        // done for signature calculation must still stop at the key's limit.
+        $this->setConfigValue('MAX_UPLOAD_SIZE', '0');
+        $this->injectAccessKey('ak', 'secret', ['*'], 50);
+        $amzDate = gmdate('Ymd\THis\Z');
+        $request = $this->createRequest([
+            'REQUEST_METHOD' => 'PUT',
+            'REQUEST_URI' => '/bucket/key',
+            'HTTP_HOST' => 'example.local',
+            'HTTP_X_AMZ_DATE' => $amzDate,
+            'HTTP_AUTHORIZATION' => 'AWS4-HMAC-SHA256 Credential=ak/' . substr($amzDate, 0, 8) . '/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=' . str_repeat('0', 64),
+        ], str_repeat('x', 60));
+
+        $this->expectException(S3Exception::class);
+        try {
+            (new Authenticator($request))->authenticate();
+        } catch (S3Exception $e) {
+            $this->assertSame('EntityTooLarge', $e->getS3Code());
+            $this->assertNull($request->getAccessKeyId());
+            throw $e;
+        }
+    }
+
+    public function testAwsChunkedEarlyCheckUsesDecodedHint(): void
+    {
+        $this->resetConfig($this->testDir);
+        $this->setConfigValue('MAX_UPLOAD_SIZE', '1'); // 1 KiB
+
+        // Wire 5000 bytes (framing overhead), decoded 900 → allowed.
+        $request = $this->createRequest([
+            'REQUEST_METHOD' => 'PUT',
+            'REQUEST_URI' => '/bucket/key',
+            'CONTENT_LENGTH' => '5000',
+            'HTTP_CONTENT_ENCODING' => 'aws-chunked',
+            'HTTP_X_AMZ_DECODED_CONTENT_LENGTH' => '900',
+        ]);
+        $auth = new Authenticator($request);
+        $auth->checkEarlyRequestSize();
+        $this->assertTrue(true);
+    }
+
+    public function testAwsChunkedEarlyCheckRejectsOversizedDecodedHint(): void
+    {
+        $this->resetConfig($this->testDir);
+        $this->setConfigValue('MAX_UPLOAD_SIZE', '1'); // 1 KiB
+
+        $request = $this->createRequest([
+            'REQUEST_METHOD' => 'PUT',
+            'REQUEST_URI' => '/bucket/key',
+            'CONTENT_LENGTH' => '5000',
+            'HTTP_CONTENT_ENCODING' => 'aws-chunked',
+            'HTTP_X_AMZ_DECODED_CONTENT_LENGTH' => '4500',
+        ]);
+        $auth = new Authenticator($request);
+
+        $this->expectException(S3Exception::class);
+        try {
+            $auth->checkEarlyRequestSize();
+        } catch (S3Exception $e) {
+            $this->assertSame('EntityTooLarge', $e->getS3Code());
+            throw $e;
+        }
+    }
+
+    public function testAwsChunkedEarlyCheckDefersWithoutHint(): void
+    {
+        $this->resetConfig($this->testDir);
+        $this->setConfigValue('MAX_UPLOAD_SIZE', '1');
+
+        // No decoded hint: cannot judge the decoded size from the wire length
+        // alone; must not reject here (spool-time enforcement decides).
+        $request = $this->createRequest([
+            'REQUEST_METHOD' => 'PUT',
+            'REQUEST_URI' => '/bucket/key',
+            'CONTENT_LENGTH' => '1200',
+            'HTTP_CONTENT_ENCODING' => 'aws-chunked',
+        ]);
+        $auth = new Authenticator($request);
+        $auth->checkEarlyRequestSize();
+        $this->assertTrue(true);
+    }
 
     public function testAccessDeniedNoHeader(): void
     {
@@ -136,8 +381,8 @@ class AuthenticatorTest extends TestCase
 
     /**
      * Regression: a client could forge Content-Length: 0 to bypass per-key
-     * upload limits while streaming a large body. checkRequestSize must use
-     * the larger of the header and the actual decoded body length.
+     * upload limits while streaming a large body. The spool counts decoded
+     * bytes while reading, so checkRequestSize must still reject it.
      */
     public function testCheckRequestSizeRejectsForgedContentLengthZero(): void
     {
@@ -154,15 +399,12 @@ class AuthenticatorTest extends TestCase
             ],
         ]);
 
+        // 200-byte actual body with a forged Content-Length: 0.
         $request = $this->createRequest([
             'REQUEST_METHOD' => 'PUT',
             'REQUEST_URI' => '/bucket/key',
-            'CONTENT_LENGTH' => '0', // forged
-        ]);
-
-        // Simulate a 200-byte body that the client actually sent.
-        $bodyRef = new \ReflectionProperty(Request::class, 'body');
-        $bodyRef->setValue($request, str_repeat('x', 200));
+            'CONTENT_LENGTH' => '0',
+        ], str_repeat('x', 200));
 
         $auth = new Authenticator($request);
 
@@ -261,11 +503,7 @@ class AuthenticatorTest extends TestCase
         $request = $this->createRequest([
             'REQUEST_METHOD' => 'PUT',
             'REQUEST_URI' => '/bucket/key',
-        ]);
-
-        // Body larger than 1 KB (1024 bytes)
-        $bodyRef = new \ReflectionProperty(Request::class, 'body');
-        $bodyRef->setValue($request, str_repeat('x', 2048));
+        ], str_repeat('x', 2048));
 
         $auth = new Authenticator($request);
 

@@ -36,6 +36,22 @@ class ConfigTest extends TestCase
         $this->assertEquals('default', Config::get('NONEXISTENT_KEY', 'default'));
     }
 
+    public function testExplicitConfigurationFile(): void
+    {
+        $previous = getenv('S3_CONFIG');
+        $file = tempnam(sys_get_temp_dir(), 's3-config-');
+        try {
+            file_put_contents($file, "[general]\nDEPLOYMENT_TEST=private-config\n");
+            putenv('S3_CONFIG=' . $file);
+            (new \ReflectionProperty(Config::class, 'config'))->setValue(null, null);
+            self::assertSame('private-config', Config::get('DEPLOYMENT_TEST'));
+        } finally {
+            putenv($previous === false ? 'S3_CONFIG' : 'S3_CONFIG=' . $previous);
+            unlink($file);
+            $this->resetConfig($this->testDir);
+        }
+    }
+
     public function testAppDebugTrue(): void
     {
         $this->resetConfig($this->testDir);

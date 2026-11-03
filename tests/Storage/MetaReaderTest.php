@@ -51,14 +51,23 @@ class MetaReaderTest extends TestCase
         $this->assertNull($meta);
     }
 
-    public function testCalculateEtag(): void
+    public function testEtagIsContentMd5(): void
     {
-        $etag1 = $this->metaReader->calculateEtag('file.txt', 100);
-        $etag2 = $this->metaReader->calculateEtag('file.txt', 100);
-        $etag3 = $this->metaReader->calculateEtag('other.txt', 100);
+        // Files without a sidecar (written out of band or by older versions)
+        // get their MD5 computed on first access.
+        $meta = $this->metaReader->getObjectMeta('test-bucket', 'test.txt');
+        $this->assertSame(md5('hello world'), $meta['etag']);
+    }
 
-        $this->assertEquals($etag1, $etag2);
-        $this->assertNotEquals($etag1, $etag3);
+    public function testEtagFollowsContentChangesOfSameSize(): void
+    {
+        $this->assertSame(md5('hello world'), $this->metaReader->getObjectMeta('test-bucket', 'test.txt')['etag']);
+
+        // Same size, different content, replaced out of band (new inode).
+        $path = $this->bucketDir . '/test.txt';
+        file_put_contents($path . '.new', 'HELLO WORLD');
+        rename($path . '.new', $path);
+        $this->assertSame(md5('HELLO WORLD'), $this->metaReader->getObjectMeta('test-bucket', 'test.txt')['etag']);
     }
 
     public function testGetFileSize(): void
@@ -99,8 +108,6 @@ class MetaReaderTest extends TestCase
         $meta = $this->metaReader->getObjectMeta('test-bucket', 'my%20file.txt');
 
         $this->assertNotNull($meta);
-        // ETag must use the canonical (decoded) key form, matching what LIST would produce
-        $expectedEtag = md5('my file.txt' . 4);
-        $this->assertEquals($expectedEtag, $meta['etag']);
+        $this->assertEquals(md5('data'), $meta['etag']);
     }
 }

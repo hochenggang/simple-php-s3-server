@@ -6,13 +6,13 @@ use S3Gateway\Config;
 use S3Gateway\Exception\S3Exception;
 use S3Gateway\Http\Request;
 use S3Gateway\Http\Response;
-use S3Gateway\Storage\FileStorage;
+use S3Gateway\Storage\Storage;
 
 class BucketController
 {
-    private FileStorage $storage;
+    private Storage $storage;
 
-    public function __construct(FileStorage $storage)
+    public function __construct(Storage $storage)
     {
         $this->storage = $storage;
     }
@@ -20,8 +20,11 @@ class BucketController
     public function listBuckets(Request $request, Response $response): void
     {
         $buckets = $this->storage->listBuckets();
-        $dataDir = $this->storage->getPathResolver()->getDataDir();
-        $xml = XmlResponse::listBuckets($buckets, $dataDir);
+        $created = [];
+        foreach ($buckets as $bucket) {
+            $created[$bucket] = $this->storage->getBucketCreationTime($bucket);
+        }
+        $xml = XmlResponse::listBuckets($buckets, $created);
 
         $response
             ->setHeader('Content-Type', 'application/xml')
@@ -190,7 +193,7 @@ class BucketController
         // as InvalidArgumentException and get coerced by Router into the less
         // specific InvalidRequest S3 code.
         try {
-            $this->storage->getPathResolver()->validateBucketName($bucket);
+            $this->storage->validateBucketName($bucket);
         } catch (\InvalidArgumentException $e) {
             throw S3Exception::invalidBucketName();
         }
